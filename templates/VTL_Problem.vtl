@@ -1,0 +1,935 @@
+## =============================================================================
+## VTL template: PDDL problem generation
+## =============================================================================
+## Generates a PDDL problem instance from an annotated SysML model.
+##
+## Run it from MSoSA through Tools > Report Wizard. The report scope has to
+## include the package carrying <<PDDL_Problem>>. Objects as well as initial and
+## goal states may live in other packages.
+##
+## If the metric references total-cost and no <<PDDL_InitState>>
+## initializes that function, the template reports the modeling error instead
+## of supplying the missing fact. The cost initialization belongs in the model:
+## a function-based init state with value 0. A goal over a type that refers to
+## a function or uses a predicate without exactly one parameter is reported the
+## same way, with no goal generated.
+##
+## Besides the goal states, the tag 'goal' of the problem can hold a formula, for
+## example a disjunction or a quantifier. It follows the goal facts in the same
+## (:goal (and ...)).
+##
+## -----------------------------------------------------------------------------
+## Expected stereotypes
+## -----------------------------------------------------------------------------
+##   PDDL_Problem on a package
+##     problemName        string, otherwise the package name
+##     domain             reference to the package with <<PDDL_Domain>>
+##     metricDirection    MetricDirectionKind (minimize/maximize)
+##     metricExpression   string, e.g. "total-cost"
+##
+##   PDDL_Object on an InstanceSpecification
+##     objectname         string, otherwise the element name
+##     type taken from the classifier
+##
+##   PDDL_Constant on an InstanceSpecification
+##     constantname       string, otherwise the element name. The constant is
+##                        declared in the domain (:constants); here it only
+##                        appears as an argument.
+##
+##   PDDL_InitState / PDDL_GoalState on a Dependency
+##     supplier           predicate signal <<PDDL_Predicate>> or
+##                        function signal <<PDDL_Function>>
+##     client             the arguments. Only clients carrying <<PDDL_Object>>
+##                        or <<PDDL_Constant>> count: UML requires at least one client on a
+##                        dependency, but a nullary function has no argument
+##                        objects and therefore carries a formal client, which
+##                        is filtered out here.
+##     isNegated          boolean, for negated initial states
+##     value              real, for function values
+##
+## Tagged values are read by tagDefinition.name rather than by position; the
+## domain template explains why.
+##
+## -----------------------------------------------------------------------------
+## Two derived passes
+## -----------------------------------------------------------------------------
+## Binary init predicates from slots: if a <<PDDL_Object>> or <<PDDL_Constant>>
+##   instance has a slot whose value is itself such an instance, a binary
+##   predicate is generated. Which one follows from the type signature: the
+##   template looks for a <<PDDL_Predicate>> with two parameters whose types
+##   match the owner type and the value type. If no predicate or more than one
+##   matches, or if no binary predicate is among the selected elements at all,
+##   the template writes a warning instead of a fact. (Section 5b)
+##
+## Goal through a type: if the client of a <<PDDL_GoalState>> is a
+##   <<PDDL_Type>> classifier rather than an instance, the predicate is
+##   generated for every <<PDDL_Object>> instance of that type. (Section 6)
+## =============================================================================
+
+## -----------------------------------------------------------------------------
+## Macro: argument name of an instance. <<PDDL_Object>> -> objectName,
+## <<PDDL_Constant>> -> constantName, each falling back to the element name.
+## Anything else (such as the formal client of a nullary function) yields ""
+## and does not count as an argument. Result in $argNameResult.
+## -----------------------------------------------------------------------------
+#macro(argName $inst)##
+#set($argNameResult = "")##
+#set($argNameTag = "")##
+#if($report.containsStereotype($inst, "PDDL_Object"))##
+#set($argNameTag = $inst.objectname)##
+#if(!$argNameTag || $argNameTag == "")#set($argNameTag = $inst.name)#end##
+#set($argNameResult = $argNameTag)##
+#elseif($report.containsStereotype($inst, "PDDL_Constant"))##
+#set($argNameTag = $inst.constantname)##
+#if(!$argNameTag || $argNameTag == "")#set($argNameTag = $inst.name)#end##
+#set($argNameResult = $argNameTag)##
+#end##
+#end
+
+## -----------------------------------------------------------------------------
+## Formula macros, the same as in the domain template. They render the goal formula
+## in the tag 'goal' of the problem. Warnings are collected in $formulaWarn.
+## -----------------------------------------------------------------------------
+## Predicate atom -> (predName ?arg1 ?arg2 ...)
+## Nullary atoms have no arguments tag, hence the size() > 0 guard.
+## -----------------------------------------------------------------------------
+#macro(atomToPDDL $atom)##
+#set($signal = false)##
+#set($args = [])##
+#foreach($tv in $atom.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "predicate")#set($signal = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "arguments")#set($args = $tv.value)#end##
+#end##
+#end##
+#if(!$signal)##
+(UNKNOWN-ATOM-$atom.name)##
+#else##
+#set($predName = $signal.predicatename)##
+#if(!$predName || $predName == "")#set($predName = $signal.name)#end##
+($predName#foreach($arg in $args) $arg#end)##
+#end##
+#end
+
+## -----------------------------------------------------------------------------
+## Function atom -> (funcName ?arg1 ?arg2 ...) or (funcName)
+## -----------------------------------------------------------------------------
+#macro(functionAtomToPDDL $atom)##
+#set($funcRef = false)##
+#set($fArgs = [])##
+#foreach($tv in $atom.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "function")#set($funcRef = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "arguments")#set($fArgs = $tv.value)#end##
+#end##
+#end##
+#if(!$funcRef)##
+(UNKNOWN-FUNCTION-ATOM-$atom.name)##
+#else##
+#set($funcName = $funcRef.functionname)##
+#if(!$funcName || $funcName == "")#set($funcName = $funcRef.name)#end##
+($funcName#foreach($fArg in $fArgs) $fArg#end)##
+#end##
+#end
+
+## -----------------------------------------------------------------------------
+## Target of a numeric effect -> (funcName args...)
+## The target references a PDDL_Function directly, not a FunctionAtom. Its
+## arguments come from the tag 'targetArguments'; a nullary function such as
+## total-cost renders as (total-cost). If the number of arguments differs from
+## the function's arity, a note goes to $formulaWarn and the target is rendered
+## as modeled.
+## -----------------------------------------------------------------------------
+#macro(functionRefToPDDL $funcRef $frArgs $frOwner)##
+#set($frName = "")##
+#set($frName = $funcRef.functionname)##
+#if(!$frName || $frName == "")#set($frName = $funcRef.name)#end##
+#set($frArity = 0)##
+#if($funcRef.ownedAttribute)#foreach($frAttr in $funcRef.ownedAttribute)#if($frAttr.name && $frAttr.type)#set($frArity = $frArity + 1)#end#end#end##
+#if($frArity != $frArgs.size())#set($dummy = $formulaWarn.add("numeric effect '$frOwner': target function '$frName' has $frArity parameter(s), targetArguments gives $frArgs.size(); rendered as modeled"))#end##
+($frName#foreach($frArg in $frArgs) $frArg#end)##
+#end
+
+## -----------------------------------------------------------------------------
+## Formula -> PDDL, recursive, covers every formula stereotype.
+## The final else renders a marker rather than an empty string.
+## -----------------------------------------------------------------------------
+#macro(formulaToPDDL $formula)##
+## Logical operators
+#set($isAnd = $report.containsStereotype($formula, "PDDL_And"))##
+#set($isOr = $report.containsStereotype($formula, "PDDL_Or"))##
+#set($isNot = $report.containsStereotype($formula, "PDDL_Not"))##
+#set($isImply = $report.containsStereotype($formula, "PDDL_Imply"))##
+## Atomic formulas
+#set($isAtom = $report.containsStereotype($formula, "PDDL_PredicateAtom"))##
+#set($isFuncAtom = $report.containsStereotype($formula, "PDDL_FunctionAtom"))##
+#set($isLiteral = $report.containsStereotype($formula, "PDDL_Literal"))##
+## Numeric effects
+#set($isIncrease = $report.containsStereotype($formula, "PDDL_Increase"))##
+#set($isDecrease = $report.containsStereotype($formula, "PDDL_Decrease"))##
+#set($isAssign = $report.containsStereotype($formula, "PDDL_Assign"))##
+#set($isScaleUp = $report.containsStereotype($formula, "PDDL_ScaleUp"))##
+#set($isScaleDown = $report.containsStereotype($formula, "PDDL_ScaleDown"))##
+## Comparison and conditional formulas
+#set($isComparison = $report.containsStereotype($formula, "PDDL_Comparison"))##
+#set($isArith = $report.containsStereotype($formula, "PDDL_ArithmeticExpression"))##
+#set($isConditional = $report.containsStereotype($formula, "PDDL_ConditionalEffect"))##
+## Quantifiers
+#set($isExists = $report.containsStereotype($formula, "PDDL_Exists"))##
+#set($isForall = $report.containsStereotype($formula, "PDDL_Forall"))##
+##
+#if($isAnd && $formula.taggedValue)##
+#set($subs = [])##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operands")#set($subs = $tv.value)#end##
+#end##
+#end##
+#if($subs.size() < 2)##
+(UNKNOWN-AND-$formula.name)##
+#else##
+(and#foreach($sub in $subs) #formulaToPDDL($sub)#end)##
+#end##
+##
+#elseif($isOr && $formula.taggedValue)##
+#set($subs = [])##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operands")#set($subs = $tv.value)#end##
+#end##
+#end##
+#if($subs.size() < 2)##
+(UNKNOWN-OR-$formula.name)##
+#else##
+(or#foreach($sub in $subs) #formulaToPDDL($sub)#end)##
+#end##
+##
+#elseif($isNot && $formula.taggedValue)##
+#set($inner = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operand")#set($inner = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$inner)##
+(UNKNOWN-NOT-$formula.name)##
+#else##
+(not #formulaToPDDL($inner))##
+#end##
+##
+#elseif($isImply && $formula.taggedValue)##
+#set($implyCond = false)##
+#set($implyConseq = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "condition")#set($implyCond = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "consequence")#set($implyConseq = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$implyCond || !$implyConseq)##
+(UNKNOWN-IMPLY-$formula.name)##
+#else##
+## Velocity variables are global: a nested imply in the condition would
+## overwrite $implyConseq. The list is built before the recursive calls.
+(imply#foreach($imSub in [$implyCond, $implyConseq]) #formulaToPDDL($imSub)#end)##
+#end##
+##
+#elseif($isAtom)##
+#atomToPDDL($formula)##
+##
+#elseif($isFuncAtom)##
+#functionAtomToPDDL($formula)##
+##
+#elseif($isLiteral && $formula.taggedValue)##
+## The value goes straight into the output here, so it is checked before it
+## is written. A model element rather than a number would otherwise end up
+## in the file as a Java object reference.
+#set($litValue = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "value")#set($litValue = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$litValue)##
+(UNKNOWN-LITERAL-$formula.name)##
+#else##
+$litValue##
+#end##
+##
+## Numeric effects, pattern: (keyword (target-func) value-formula)
+## target -> reference to a PDDL_Function
+## value, factor or divisor -> a numeric term (PDDL_Formula element)
+## targetArguments -> arguments of the target function
+##
+#elseif($isIncrease && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neValue = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "value")#set($neValue = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neValue)##
+(UNKNOWN-INCREASE-$formula.name)##
+#else##
+(increase #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neValue))##
+#end##
+##
+#elseif($isDecrease && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neValue = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "value")#set($neValue = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neValue)##
+(UNKNOWN-DECREASE-$formula.name)##
+#else##
+(decrease #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neValue))##
+#end##
+##
+#elseif($isAssign && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neValue = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "value")#set($neValue = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neValue)##
+(UNKNOWN-ASSIGN-$formula.name)##
+#else##
+(assign #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neValue))##
+#end##
+##
+#elseif($isScaleUp && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neFactor = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "factor")#set($neFactor = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neFactor)##
+(UNKNOWN-SCALE-UP-$formula.name)##
+#else##
+(scale-up #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neFactor))##
+#end##
+##
+#elseif($isScaleDown && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neDivisor = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "divisor")#set($neDivisor = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neDivisor)##
+(UNKNOWN-SCALE-DOWN-$formula.name)##
+#else##
+(scale-down #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neDivisor))##
+#end##
+##
+## Comparison, pattern: (operator left right)
+## operator -> a ComparisonOperator literal
+## left -> a PDDL_Formula element
+## right -> a PDDL_Formula element
+##
+#elseif($isComparison && $formula.taggedValue)##
+#set($cmpOp = false)##
+#set($cmpLeft = false)##
+#set($cmpRight = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operator")#set($cmpOp = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "left")#set($cmpLeft = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "right")#set($cmpRight = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$cmpOp || !$cmpLeft || !$cmpRight)##
+(UNKNOWN-COMPARISON-$formula.name)##
+#else##
+#set($cmpOpName = $cmpOp.name)##
+#if($cmpOpName == "equal")#set($cmpSymbol = "=")##
+#elseif($cmpOpName == "lessThan")#set($cmpSymbol = "<")##
+#elseif($cmpOpName == "greaterThan")#set($cmpSymbol = ">")##
+#elseif($cmpOpName == "lessOrEqual")#set($cmpSymbol = "<=")##
+#elseif($cmpOpName == "greaterOrEqual")#set($cmpSymbol = ">=")##
+#else#set($cmpSymbol = $cmpOpName)##
+#end##
+($cmpSymbol #formulaToPDDL($cmpLeft) #formulaToPDDL($cmpRight))##
+#end##
+##
+## Arithmetic expression, pattern: (op left right), op from ArithmeticOperator
+## (plus, minus, times, divide). Operands are built into a list before the
+## recursive calls, as for imply.
+##
+#elseif($isArith && $formula.taggedValue)##
+#set($arOp = false)##
+#set($arLeft = false)##
+#set($arRight = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operator")#set($arOp = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "left")#set($arLeft = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "right")#set($arRight = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$arOp || !$arLeft || !$arRight)##
+(UNKNOWN-ARITHMETIC-$formula.name)##
+#else##
+#set($arOpName = $arOp.name)##
+#if($arOpName == "plus")#set($arSymbol = "+")##
+#elseif($arOpName == "minus")#set($arSymbol = "-")##
+#elseif($arOpName == "times")#set($arSymbol = "*")##
+#elseif($arOpName == "divide")#set($arSymbol = "/")##
+#else#set($arSymbol = "UNKNOWN-OPERATOR-$arOpName")##
+#end##
+($arSymbol#foreach($arSub in [$arLeft, $arRight]) #formulaToPDDL($arSub)#end)##
+#end##
+##
+## Conditional effect
+## Pattern: (when condition effect)
+##
+#elseif($isConditional && $formula.taggedValue)##
+#set($whenCond = false)##
+#set($whenEffect = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "condition")#set($whenCond = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "effect")#set($whenEffect = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$whenCond || !$whenEffect)##
+(UNKNOWN-CONDITIONAL-$formula.name)##
+#else##
+## A single numeric effect gets the (and ...) wrapper, as the top-level effect does.##
+#set($numWhen = ($report.containsStereotype($whenEffect, "PDDL_Increase") || $report.containsStereotype($whenEffect, "PDDL_Decrease") || $report.containsStereotype($whenEffect, "PDDL_Assign") || $report.containsStereotype($whenEffect, "PDDL_ScaleUp") || $report.containsStereotype($whenEffect, "PDDL_ScaleDown")))##
+#if($numWhen)(when #formulaToPDDL($whenCond) (and #formulaToPDDL($whenEffect)))#{else}(when #formulaToPDDL($whenCond) #formulaToPDDL($whenEffect))#{end}##
+#end##
+##
+## Pattern: (exists/forall (?var1 - type1 ...) scope)
+## scope -> a PDDL_Formula element
+## variables -> a string list, inherited from the parent stereotype
+## variableTypes -> a list of PDDL_Type, inherited from the parent stereotype
+##
+#elseif($isExists && $formula.taggedValue)##
+## Read by name: if one of the three is missing, the indices shift and a
+## model element gets rendered where a variable name belongs.
+#set($qScope = false)##
+#set($qVars = [])##
+#set($qTypes = [])##
+#foreach($qtv in $formula.taggedValue)##
+#if($qtv.tagDefinition && $qtv.value && $qtv.value.size() > 0)##
+#if($qtv.tagDefinition.name == "scope")#set($qScope = $qtv.value.get(0))#end##
+#if($qtv.tagDefinition.name == "variables")#set($qVars = $qtv.value)#end##
+#if($qtv.tagDefinition.name == "variableTypes")#set($qTypes = $qtv.value)#end##
+#end##
+#end##
+## Without variables or a body this renders a marker, not PDDL.
+#if($qVars.size() == 0 || !$qScope)##
+(UNKNOWN-QUANTIFIER-$formula.name)##
+#else##
+(exists (#foreach($qv in $qVars)#set($qi = $foreach.index)$qv#if($qTypes.size() > $qi)#set($qtE = $qTypes.get($qi))#set($qtN = $qtE.typename)#if(!$qtN || $qtN == "")#set($qtN = $qtE.name)#end - $qtN.toLowerCase()#end#if($foreach.hasNext) #end#end) #formulaToPDDL($qScope))##
+#end##
+##
+#elseif($isForall && $formula.taggedValue)##
+## Read by name: if one of the three is missing, the indices shift and a
+## model element gets rendered where a variable name belongs.
+#set($qScope = false)##
+#set($qVars = [])##
+#set($qTypes = [])##
+#foreach($qtv in $formula.taggedValue)##
+#if($qtv.tagDefinition && $qtv.value && $qtv.value.size() > 0)##
+#if($qtv.tagDefinition.name == "scope")#set($qScope = $qtv.value.get(0))#end##
+#if($qtv.tagDefinition.name == "variables")#set($qVars = $qtv.value)#end##
+#if($qtv.tagDefinition.name == "variableTypes")#set($qTypes = $qtv.value)#end##
+#end##
+#end##
+## Without variables or a body this renders a marker, not PDDL.
+#if($qVars.size() == 0 || !$qScope)##
+(UNKNOWN-QUANTIFIER-$formula.name)##
+#else##
+## A single numeric effect as the body gets the (and ...) wrapper, as the top-level effect does.##
+#set($numScope = ($report.containsStereotype($qScope, "PDDL_Increase") || $report.containsStereotype($qScope, "PDDL_Decrease") || $report.containsStereotype($qScope, "PDDL_Assign") || $report.containsStereotype($qScope, "PDDL_ScaleUp") || $report.containsStereotype($qScope, "PDDL_ScaleDown")))##
+(forall (#foreach($qv in $qVars)#set($qi = $foreach.index)$qv#if($qTypes.size() > $qi)#set($qtE = $qTypes.get($qi))#set($qtN = $qtE.typename)#if(!$qtN || $qtN == "")#set($qtN = $qtE.name)#end - $qtN.toLowerCase()#end#if($foreach.hasNext) #end#end) #if($numScope)(and #formulaToPDDL($qScope))#{else}#formulaToPDDL($qScope)#{end})##
+#end##
+##
+## Unknown or incomplete formula stereotype: a visible marker instead of
+## empty output. VAL then reports an unknown predicate, so the mistake
+## surfaces instead of producing quietly invalid PDDL.
+#else##
+(UNKNOWN-FORMULA-$formula.name)##
+#end##
+#end
+
+## -----------------------------------------------------------------------------
+## 1. Find the problem element
+## -----------------------------------------------------------------------------
+#set($pddlProblem = false)
+#set($problemPackages = [])
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Problem"))
+#set($pddlProblem = $elem)
+#set($dummy = $problemPackages.add($elem.name))
+#end
+#end
+
+#if(!$pddlProblem)
+;; ERROR: No PDDL_Problem found
+#elseif($problemPackages.size() > 1)
+;; ERROR: $problemPackages.size() packages with PDDL_Problem under the start element $problemPackages. Start the report at one of them.
+#else
+
+## Problem name
+#set($problemName = $pddlProblem.problemname)
+#if(!$problemName || $problemName == "")
+#set($problemName = $pddlProblem.name.toLowerCase().replaceAll(" ", "_"))
+#end
+
+## -----------------------------------------------------------------------------
+## 2. Resolve the domain reference
+## Problem.domain references the package carrying <<PDDL_Domain>>
+## It is read as a list, as a single value, from the tag 'domain' by name, or from any tag that
+## points at a <<PDDL_Domain>>.
+## -----------------------------------------------------------------------------
+#set($domainName = "unknown-domain")
+## As a list
+#set($domainRef = $pddlProblem.domain)
+#if($domainRef && $domainRef.size() > 0)
+#set($pddlDomain = $domainRef.get(0))
+#set($domainName = $pddlDomain.domainname)
+#if(!$domainName || $domainName == "")#set($domainName = $pddlDomain.name.toLowerCase().replaceAll(" ", "_"))#end
+#else
+## As a single value
+#if($domainRef && $domainRef.domainname)
+#set($domainName = $domainRef.domainname)
+#elseif($domainRef && $domainRef.name)
+#set($domainName = $domainRef.name.toLowerCase().replaceAll(" ", "_"))
+#else
+## From the tag 'domain' by name
+#if($pddlProblem.taggedValue && $pddlProblem.taggedValue.size() > 0)
+#foreach($tv in $pddlProblem.taggedValue)
+#if($tv.tagDefinition && $tv.tagDefinition.name == "domain" && $tv.value && $tv.value.size() > 0)
+#set($tvVal = $tv.value.get(0))
+#set($domainName = $tvVal.domainname)
+#if(!$domainName || $domainName == "")#set($domainName = $tvVal.name.toLowerCase().replaceAll(" ", "_"))#end
+#end
+#end
+#end
+## From any tag that points at a <<PDDL_Domain>>
+#if($domainName == "unknown-domain" && $pddlProblem.taggedValue && $pddlProblem.taggedValue.size() > 0)
+#foreach($tv in $pddlProblem.taggedValue)
+#if($tv.value && $tv.value.size() > 0)
+#set($tvVal = $tv.value.get(0))
+#if($report.containsStereotype($tvVal, "PDDL_Domain"))
+#set($domainName = $tvVal.domainname)
+#if(!$domainName || $domainName == "")#set($domainName = $tvVal.name.toLowerCase().replaceAll(" ", "_"))#end
+#end
+#end
+#end
+#end
+#end
+#end
+#if($domainName == "unknown-domain")
+;; WARN domain reference could not be resolved from the model. Set the
+;; 'domain' tagged value on the PDDL_Problem package
+#end
+
+## -----------------------------------------------------------------------------
+## 3. Header
+## -----------------------------------------------------------------------------
+(define (problem $problemName)
+
+  (:domain $domainName)
+
+## -----------------------------------------------------------------------------
+## 4. Objects section
+## Collect every element carrying <<PDDL_Object>>. Constants are declared in
+## the domain and not repeated here.
+## -----------------------------------------------------------------------------
+  (:objects
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Object") && !$report.containsStereotype($elem, "PDDL_Constant"))
+#set($objName = $elem.objectname)
+#if(!$objName || $objName == "")#set($objName = $elem.name)#end
+## Type taken from the classifier
+#set($objType = "object")
+#if($elem.classifier && $elem.classifier.size() > 0)
+#set($typeElement = $elem.classifier.get(0))
+#set($objType = $typeElement.typename)
+#if(!$objType || $objType == "")#set($objType = $typeElement.name)#end
+#end
+    $objName - $objType.toLowerCase()
+#end
+#end
+  )
+
+## -----------------------------------------------------------------------------
+## 5. Init section
+## Init states are dependencies carrying <<PDDL_InitState>>, of two kinds:
+##   predicate-based, supplier is a PDDL_Predicate signal
+##      -> (predName obj1 obj2 ...) or (not (predName obj1 ...))
+##   function-based, supplier is a PDDL_Function signal
+##      -> (= (funcName obj1 obj2 ...) value)
+## -----------------------------------------------------------------------------
+  (:init
+#set($totalCostInitialized = false)
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_InitState"))
+## Determine the supplier, predicate or function
+#if($elem.supplier && $elem.supplier.size() > 0)
+#set($supplierSignal = $elem.supplier.get(0))
+## Arguments come from the clients carrying <<PDDL_Object>> or <<PDDL_Constant>>
+## (macro argName, see the header).
+#set($initArgs = "")
+#if($elem.client && $elem.client.size() > 0)
+#foreach($obj in $elem.client)
+#argName($obj)
+#if($argNameResult != "")#set($initArgs = "$initArgs $argNameResult")#end
+#end
+#end
+## Further arguments from 'additionalArgs' follow the clients. They also cover an object
+## that fills two argument positions, which a second client cannot express.
+#if($elem.taggedValue)
+#foreach($aaTv in $elem.taggedValue)
+#if($aaTv.tagDefinition && $aaTv.tagDefinition.name == "additionalArgs" && $aaTv.value)
+#foreach($aaObj in $aaTv.value)
+#argName($aaObj)
+#if($argNameResult != "")#set($initArgs = "$initArgs $argNameResult")#end
+#end
+#end
+#end
+#end
+## Read isNegated and value by name
+#set($isNeg = false)
+#set($funcValue = 0)
+#set($hatWert = false)
+#if($elem.taggedValue)
+#foreach($tv in $elem.taggedValue)
+#if($tv.tagDefinition && $tv.tagDefinition.name == "isNegated" && $tv.value && $tv.value.size() > 0)
+#set($tvRaw = $tv.value.get(0))
+#if($tvRaw == true || $tvRaw.toString() == "true")#set($isNeg = true)#end
+#end
+#if($tv.tagDefinition && $tv.tagDefinition.name == "value" && $tv.value && $tv.value.size() > 0)
+#set($funcValue = $tv.value.get(0))
+#set($hatWert = true)
+#end
+#end
+#end
+## Function-based
+#if($report.containsStereotype($supplierSignal, "PDDL_Function"))
+#set($funcName = $supplierSignal.functionname)
+#if(!$funcName || $funcName == "")#set($funcName = $supplierSignal.name)#end
+## Without 'value' no fact, but a warning
+#if(!$hatWert)
+    ;; WARN init state '$elem.name' sets function '$funcName' without a 'value'. No fact generated.
+#else
+#if($funcName == "total-cost")#set($totalCostInitialized = true)#end
+## Integer-valued inits without a trailing ".0", because :action-costs needs integers
+#set($fvStr = "$funcValue")
+#if($fvStr.endsWith(".0"))#set($fvStr = $fvStr.substring(0, $fvStr.length() - 2))#end
+    (= ($funcName$initArgs) $fvStr)
+#end
+## Predicate-based
+#else
+#set($predName = $supplierSignal.predicatename)
+#if(!$predName || $predName == "")#set($predName = $supplierSignal.name)#end
+#if($isNeg)
+    (not ($predName$initArgs))
+#else
+    ($predName$initArgs)
+#end
+#end
+#end
+#end
+#end
+## -----------------------------------------------------------------------------
+## 5b. Binary init predicates derived from slots
+## For every <<PDDL_Object>> or <<PDDL_Constant>> instance, each slot whose value
+## is itself such an instance yields a binary predicate. Which one follows from
+## the type signature of owner and value: the template looks for a
+## <<PDDL_Predicate>> with exactly two typed parameters that match. No predicate
+## name is hard coded here. Scalar slots are skipped, and a model without object
+## slots produces nothing. Every value of a multi-valued slot counts.
+##
+## The template reports instead of guessing:
+##  - exactly one matching predicate: the fact is written
+##  - no matching predicate: warning, no fact
+##  - several predicates with the same signature: warning listing them, no fact
+##  - no binary predicate among the selected elements at all, but object slots
+##    present: one summary warning (typically the run started at the problem
+##    package instead of the model root)
+## -----------------------------------------------------------------------------
+#set($binSigNames = [])
+#set($binSigT0 = [])
+#set($binSigT1 = [])
+#foreach($sig in $elements)
+#if($report.containsStereotype($sig, "PDDL_Predicate") && $sig.ownedAttribute && $sig.ownedAttribute.size() == 2 && $sig.ownedAttribute.get(0).type && $sig.ownedAttribute.get(1).type)
+#set($p0t = "")
+#set($p0t = $sig.ownedAttribute.get(0).type.typename)
+#if(!$p0t || $p0t == "")#set($p0t = $sig.ownedAttribute.get(0).type.name)#end
+#set($p1t = "")
+#set($p1t = $sig.ownedAttribute.get(1).type.typename)
+#if(!$p1t || $p1t == "")#set($p1t = $sig.ownedAttribute.get(1).type.name)#end
+#set($pn = "")
+#set($pn = $sig.predicatename)
+#if(!$pn || $pn == "")#set($pn = $sig.name)#end
+#set($dummy = $binSigNames.add($pn))
+#set($dummy = $binSigT0.add($p0t))
+#set($dummy = $binSigT1.add($p1t))
+#end
+#end
+#set($slotsWithoutSignals = 0)
+#foreach($obj in $elements)
+#if(($report.containsStereotype($obj, "PDDL_Object") || $report.containsStereotype($obj, "PDDL_Constant")) && $obj.slot && $obj.slot.size() > 0)
+#argName($obj)
+#set($ownerName = $argNameResult)
+#set($ownerType = "")
+#if($obj.classifier && $obj.classifier.size() > 0)
+#set($ownerType = $obj.classifier.get(0).typename)
+#if(!$ownerType || $ownerType == "")#set($ownerType = $obj.classifier.get(0).name)#end
+#end
+#foreach($slot in $obj.slot)
+#set($slotName = "")
+#if($slot.definingFeature)#set($slotName = $slot.definingFeature.name)#end
+#if($slot.value && $slot.value.size() > 0)
+#foreach($slotVal in $slot.value)
+#if($slotVal.instance)
+#set($valInst = $slotVal.instance)
+#argName($valInst)
+#if($argNameResult != "")
+#set($valName = $argNameResult)
+#set($valType = "")
+#if($valInst.classifier && $valInst.classifier.size() > 0)
+#set($valType = $valInst.classifier.get(0).typename)
+#if(!$valType || $valType == "")#set($valType = $valInst.classifier.get(0).name)#end
+#end
+#if($binSigNames.size() == 0)
+#set($slotsWithoutSignals = $slotsWithoutSignals + 1)
+#else
+## matching binary predicates by type signature (owner type, value type)
+#set($matches = [])
+#foreach($bn in $binSigNames)
+#if($binSigT0.get($foreach.index) == $ownerType && $binSigT1.get($foreach.index) == $valType)#set($dummy = $matches.add($bn))#end
+#end
+#if($matches.size() == 1)
+    ($matches.get(0) $ownerName $valName)
+#elseif($matches.size() == 0)
+    ;; WARN slot '$slotName' of '$ownerName' ($ownerType -> $valType = $valName): no binary <<PDDL_Predicate>> with this type signature; no fact generated
+#else
+    ;; WARN slot '$slotName' of '$ownerName' ($ownerType -> $valType = $valName): $matches.size() predicates share this type signature ($matches); no fact generated. Model the fact as <<PDDL_InitState>> or make the signatures unique
+#end
+#end
+#end
+#end
+#end
+#end
+#end
+#end
+#end
+#if($slotsWithoutSignals > 0)
+    ;; WARN $slotsWithoutSignals slot value(s) refer to objects, but no binary <<PDDL_Predicate>> is among the selected elements; slot-derived facts skipped. Generate the problem from the model root.
+#end
+## The metric references total-cost but no init state initializes the
+## function. The initialization belongs in the model as a function-based
+## init state.
+#set($mDirCheck = $pddlProblem.metricdirection)
+#set($mExprCheck = $pddlProblem.metricexpression)
+#if($mDirCheck && $mExprCheck && $mExprCheck.toString().contains("total-cost") && !$totalCostInitialized)
+    ;; WARN metric references 'total-cost' but no <<PDDL_InitState>> initializes it, so planners may reject this problem. Add a function-based InitState (supplier = total-cost signal, value = 0) to the model.
+#end
+  )
+
+## -----------------------------------------------------------------------------
+## 6. Goal section
+## Goal states are dependencies carrying <<PDDL_GoalState>>, predicate- or
+## function-based as for init
+## -----------------------------------------------------------------------------
+  (:goal (and
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_GoalState"))
+## Determine the supplier, predicate or function
+#if($elem.supplier && $elem.supplier.size() > 0)
+#set($supplierSignal = $elem.supplier.get(0))
+## Goal through a type: if the first client is a <<PDDL_Type>> classifier
+## rather than an instance, expand the predicate over all instances.
+#set($typeClient = false)
+#if($elem.client && $elem.client.size() > 0 && $report.containsStereotype($elem.client.get(0), "PDDL_Type") && !$report.containsStereotype($elem.client.get(0), "PDDL_Object"))
+#set($typeClient = $elem.client.get(0))
+#end
+#if($typeClient)
+#set($gPredName = $supplierSignal.predicatename)
+#if(!$gPredName || $gPredName == "")#set($gPredName = $supplierSignal.name)#end
+#set($tcName = $typeClient.name)
+## This branch only produces goals with a one-parameter predicate. A function
+## or a predicate of another arity is reported instead of turned into a wrong
+## goal. Parameters are counted as in the domain template:
+## attributes with a name and a type.
+#set($tcNeg = false)
+#if($elem.taggedValue)
+#foreach($tv in $elem.taggedValue)
+#if($tv.tagDefinition && $tv.tagDefinition.name == "isNegated" && $tv.value && $tv.value.size() > 0)
+#set($tvRaw = $tv.value.get(0))
+#if($tvRaw == true || $tvRaw.toString() == "true")#set($tcNeg = true)#end
+#end
+#end
+#end
+#set($tcArity = 0)
+#if($supplierSignal.ownedAttribute)
+#foreach($attr in $supplierSignal.ownedAttribute)
+#if($attr.name && $attr.type)#set($tcArity = $tcArity + 1)#end
+#end
+#end
+#if($report.containsStereotype($supplierSignal, "PDDL_Function"))
+    ;; WARN goal over type '$tcName' refers to function '$supplierSignal.name'. Numeric goals over a type are not supported; no goal generated. Model one <<PDDL_GoalState>> per object.
+#elseif($tcArity != 1)
+    ;; WARN goal over type '$tcName' uses predicate '$gPredName' with $tcArity parameters. A goal over a type needs a predicate with exactly one parameter; no goal generated.
+#else
+## Objects and constants of all subtypes count as well. The first classifier is
+## followed up its generalizations (as in the domain template: general.get(0))
+## until the goal type or the root is reached. A type that comes a second time
+## means a cycle (TYP-04): no goal for that object, and a warning. isNegated
+## gives one (not ...) goal per object.
+#set($tcZyklen = [])
+#foreach($inst in $elements)
+#if(($report.containsStereotype($inst, "PDDL_Object") || $report.containsStereotype($inst, "PDDL_Constant")) && $inst.classifier && $inst.classifier.size() > 0)
+#set($tcHit = false)
+#set($tcSeen = [])
+#set($tcCur = $inst.classifier.get(0))
+#foreach($tcStep in $elements)
+#if(!$tcCur || $tcHit)#break#end
+#if($tcSeen.contains($tcCur))
+#if(!$tcZyklen.contains($tcCur.name))#set($dummy = $tcZyklen.add($tcCur.name))#end
+#set($tcCur = false)
+#elseif($tcCur.name == $tcName)
+#set($tcHit = true)
+#else
+#set($dummy = $tcSeen.add($tcCur))
+#if($tcCur.general && $tcCur.general.size() > 0)
+#set($tcCur = $tcCur.general.get(0))
+#else
+#set($tcCur = false)
+#end
+#end
+#end
+#if($tcHit)
+#argName($inst)
+#set($iName = $argNameResult)
+#if($tcNeg)
+    (not ($gPredName $iName))
+#else
+    ($gPredName $iName)
+#end
+#end
+#end
+#end
+#if($tcZyklen.size() > 0)
+    ;; WARN goal over type '$tcName': the type hierarchy has a cycle at $tcZyklen. No goal for objects on the cycle; TYP-04 reports the cycle.
+#end
+#end
+#else
+## Arguments from the clients, only those carrying <<PDDL_Object>> or
+## <<PDDL_Constant>> (macro argName)
+#set($goalArgs = "")
+#if($elem.client && $elem.client.size() > 0)
+#foreach($obj in $elem.client)
+#argName($obj)
+#if($argNameResult != "")#set($goalArgs = "$goalArgs $argNameResult")#end
+#end
+#end
+## Further arguments from 'additionalArgs', as in the init section.
+#if($elem.taggedValue)
+#foreach($aaTv in $elem.taggedValue)
+#if($aaTv.tagDefinition && $aaTv.tagDefinition.name == "additionalArgs" && $aaTv.value)
+#foreach($aaObj in $aaTv.value)
+#argName($aaObj)
+#if($argNameResult != "")#set($goalArgs = "$goalArgs $argNameResult")#end
+#end
+#end
+#end
+#end
+## Read isNegated and value by name
+#set($isNeg = false)
+#set($funcValue = 0)
+#if($elem.taggedValue)
+#foreach($tv in $elem.taggedValue)
+#if($tv.tagDefinition && $tv.tagDefinition.name == "isNegated" && $tv.value && $tv.value.size() > 0)
+#set($tvRaw = $tv.value.get(0))
+#if($tvRaw == true || $tvRaw.toString() == "true")#set($isNeg = true)#end
+#end
+#if($tv.tagDefinition && $tv.tagDefinition.name == "value" && $tv.value && $tv.value.size() > 0)
+#set($funcValue = $tv.value.get(0))
+#end
+#end
+#end
+## Function-based (e.g. a numeric goal)
+#if($report.containsStereotype($supplierSignal, "PDDL_Function"))
+#set($funcName = $supplierSignal.functionname)
+#if(!$funcName || $funcName == "")#set($funcName = $supplierSignal.name)#end
+#set($fvStr = "$funcValue")
+#if($fvStr.endsWith(".0"))#set($fvStr = $fvStr.substring(0, $fvStr.length() - 2))#end
+    (= ($funcName$goalArgs) $fvStr)
+## Predicate-based
+#else
+#set($predName = $supplierSignal.predicatename)
+#if(!$predName || $predName == "")#set($predName = $supplierSignal.name)#end
+#if($isNeg)
+    (not ($predName$goalArgs))
+#else
+    ($predName$goalArgs)
+#end
+#end
+#end
+#end
+#end
+#end
+## Goal formula from the tag 'goal' of the problem, rendered like the formulas of the actions
+## (Mode B). Its atoms name objects, constants or variables of a quantifier in the tag 'arguments'.
+#set($goalFormula = false)
+#if($pddlProblem.taggedValue)
+#foreach($gfTv in $pddlProblem.taggedValue)
+#if($gfTv.tagDefinition && $gfTv.tagDefinition.name == "goal" && $gfTv.value && $gfTv.value.size() > 0)#set($goalFormula = $gfTv.value.get(0))#end
+#end
+#end
+#if($goalFormula)
+#set($formulaWarn = [])
+    #formulaToPDDL($goalFormula)
+#foreach($gfWarn in $formulaWarn)
+    ;; WARN goal formula: $gfWarn
+#end
+#end
+  ))
+
+## -----------------------------------------------------------------------------
+## 7. Metric section, optional
+## From the PDDL_Problem tags: metricDirection and metricExpression
+## metricDirection is a MetricDirectionKind, metricExpression a string
+## -----------------------------------------------------------------------------
+#set($metricDir = $pddlProblem.metricdirection)
+#set($metricExpr = $pddlProblem.metricexpression)
+#if($metricDir && $metricExpr && $metricExpr != "")
+#set($metricDirName = "minimize")
+#if($metricDir.name)#set($metricDirName = $metricDir.name.toLowerCase())#end
+
+  (:metric $metricDirName ($metricExpr))
+#end
+
+)
+#end

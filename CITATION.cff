@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use these templates, please cite them using the metadata from this file."
+type: software
+title: "SysML to PDDL: Transformation Templates"
+authors:
+  - family-names: Nabizada
+    given-names: Hamied
+    orcid: "https://orcid.org/0000-0001-8251-837X"
+repository-code: "https://github.com/HamiedNabizada/sysml-pddl-transformation"
+license: MIT
+abstract: "Generates a PDDL domain and a problem instance from an annotated SysML model. The transformation runs as a report template in MSoSA and generates only what the model contains. Requires the profile from the pddl-sysml-profile repository."
+keywords:
+  - SysML
+  - PDDL
+  - model transformation
+  - automated planning

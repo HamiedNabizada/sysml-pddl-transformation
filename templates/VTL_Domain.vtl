@@ -1,0 +1,1363 @@
+## =============================================================================
+## VTL template: PDDL domain generation
+## =============================================================================
+## Generates a PDDL domain from an annotated SysML model.
+##
+## Run it from MSoSA through Tools > Report Wizard. The report scope has to
+## include the package carrying <<PDDL_Domain>>. Predicates, functions and
+## annotated calls may live in other packages; they are searched model-wide.
+##
+## If something is missing in the model, a visible note goes into the output
+## instead of a substitute value. A construct the template cannot express
+## appears as an UNKNOWN-... marker.
+##
+## Durative actions are not generated. If an action carries
+## <<PDDL_DurativeAction>>, the template says so in the output instead of
+## dropping the temporal semantics.
+##
+## Domain constants: every <<PDDL_Constant>> becomes an entry in (:constants ...),
+## named by its tag constantName (otherwise the element name) and typed by its
+## tag typeRef (otherwise its first classifier). In Mode B formulas a constant is
+## referenced by name in the 'arguments' tag of an atom, like any other argument.
+##
+## -----------------------------------------------------------------------------
+## Two ways to give precondition and effect
+## -----------------------------------------------------------------------------
+## Mode B, through formulas: the tagged values 'precondition' and 'effect' of
+##   the action point at formula stereotypes, which are rendered here.
+##
+## Mode A, through pins: both are derived from the pins of the action. A pin
+##   whose type is a signal with <<PDDL_Predicate>> stands for an atom; incoming
+##   pins form the precondition, outgoing pins the effect. Parameter pins carry
+##   block types with <<PDDL_Type>>. Pins of any other type are ignored, so
+##   <<PDDL_Action>> can sit on a real process action without its pins ending up
+##   in :parameters. A pin typed with a <<PDDL_Function>> carries a numeric
+##   condition or effect: on an input pin, 'comparison' gives (op (f args) rhs)
+##   in the precondition; on an output pin, 'numericEffect' gives
+##   (increase (f args) rhs) and the like in the effect. The right-hand side is
+##   'numericValue' or 'numericOperand' (<<PDDL_PinAnnotation>>). The function's
+##   arguments are bound like a predicate's. Function pins without these tags are
+##   noted in the output and not transformed. Function pins are not parameters
+##   and are not subject to the negation rule.
+##
+##   The marks isNegated and isPreserved reach a pin in two ways: through an
+##   ObjectFlow with <<PDDL_FlowAnnotation>> connecting the producing output pin
+##   to the consuming input pin, or directly on the pin via
+##   <<PDDL_PinAnnotation>>. The annotation on the pin wins.
+##
+##   A predicate pin can name the arguments of its atom in the tag 'arguments'
+##   of <<PDDL_PinAnnotation>>, as the names of parameter pins of the same
+##   action. The negation rule then compares whole atoms instead of predicate
+##   names, so (on ?c ?from) is deleted when an output pin sets (on ?c ?to).
+##
+## The choice is made per action: if 'precondition' or 'effect' is set, Mode B
+## applies to the whole action, otherwise Mode A. If only one of the two is set,
+## the template notes that in the output.
+##
+## Negation rule: what appears in the precondition, no longer in the effect and
+## is not marked as preserved gets deleted. The set of preserved predicates is
+## empty by default. It comes from the model alone.
+##
+## -----------------------------------------------------------------------------
+## Reading tagged values
+## -----------------------------------------------------------------------------
+## $report.getStereotypePropertyFirst() returns empty values in MSoSA 2024x,
+## so tags are read directly from $elem.taggedValue.
+##
+## Always by tagDefinition.name, never by position: MSoSA omits a tag that
+## is not set instead of leaving an empty slot, the remaining entries move up,
+## and the wrong value would be rendered without any sign of it.
+##
+## In Velocity, #set does not assign when the expression
+## evaluates to null. Every branch resets its variables before reading, or an
+## element would inherit the value of the previous macro call.
+##
+## An unknown or incomplete construct produces a visible marker
+## (UNKNOWN-ATOM, UNKNOWN-OR and so on). Junctors with fewer than two operands
+## are rendered as a marker as well. They are valid PDDL syntax but not what
+## the modeler meant, and the rule suite reports them on the model (FML-01,
+## FML-02).
+## =============================================================================
+
+## -----------------------------------------------------------------------------
+## Predicate atom -> (predName ?arg1 ?arg2 ...)
+## Nullary atoms have no arguments tag, hence the size() > 0 guard.
+## -----------------------------------------------------------------------------
+#macro(atomToPDDL $atom)##
+#set($signal = false)##
+#set($args = [])##
+#foreach($tv in $atom.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "predicate")#set($signal = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "arguments")#set($args = $tv.value)#end##
+#end##
+#end##
+#if(!$signal)##
+(UNKNOWN-ATOM-$atom.name)##
+#else##
+#set($predName = $signal.predicatename)##
+#if(!$predName || $predName == "")#set($predName = $signal.name)#end##
+($predName#foreach($arg in $args) $arg#end)##
+#end##
+#end
+
+## -----------------------------------------------------------------------------
+## Function atom -> (funcName ?arg1 ?arg2 ...) or (funcName)
+## -----------------------------------------------------------------------------
+#macro(functionAtomToPDDL $atom)##
+#set($funcRef = false)##
+#set($fArgs = [])##
+#foreach($tv in $atom.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "function")#set($funcRef = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "arguments")#set($fArgs = $tv.value)#end##
+#end##
+#end##
+#if(!$funcRef)##
+(UNKNOWN-FUNCTION-ATOM-$atom.name)##
+#else##
+#set($funcName = $funcRef.functionname)##
+#if(!$funcName || $funcName == "")#set($funcName = $funcRef.name)#end##
+($funcName#foreach($fArg in $fArgs) $fArg#end)##
+#end##
+#end
+
+## -----------------------------------------------------------------------------
+## Target of a numeric effect -> (funcName args...)
+## The target references a PDDL_Function directly, not a FunctionAtom. Its
+## arguments come from the tag 'targetArguments'; a nullary function such as
+## total-cost renders as (total-cost). If the number of arguments differs from
+## the function's arity, a note goes to $formulaWarn and the target is rendered
+## as modeled.
+## -----------------------------------------------------------------------------
+#macro(functionRefToPDDL $funcRef $frArgs $frOwner)##
+#set($frName = "")##
+#set($frName = $funcRef.functionname)##
+#if(!$frName || $frName == "")#set($frName = $funcRef.name)#end##
+#set($frArity = 0)##
+#if($funcRef.ownedAttribute)#foreach($frAttr in $funcRef.ownedAttribute)#if($frAttr.name && $frAttr.type)#set($frArity = $frArity + 1)#end#end#end##
+#if($frArity != $frArgs.size())#set($dummy = $formulaWarn.add("numeric effect '$frOwner': target function '$frName' has $frArity parameter(s), targetArguments gives $frArgs.size(); rendered as modeled"))#end##
+($frName#foreach($frArg in $frArgs) $frArg#end)##
+#end
+
+## -----------------------------------------------------------------------------
+## Formula -> PDDL, recursive, covers every formula stereotype.
+## The final else renders a marker rather than an empty string.
+## -----------------------------------------------------------------------------
+#macro(formulaToPDDL $formula)##
+## Logical operators
+#set($isAnd = $report.containsStereotype($formula, "PDDL_And"))##
+#set($isOr = $report.containsStereotype($formula, "PDDL_Or"))##
+#set($isNot = $report.containsStereotype($formula, "PDDL_Not"))##
+#set($isImply = $report.containsStereotype($formula, "PDDL_Imply"))##
+## Atomic formulas
+#set($isAtom = $report.containsStereotype($formula, "PDDL_PredicateAtom"))##
+#set($isFuncAtom = $report.containsStereotype($formula, "PDDL_FunctionAtom"))##
+#set($isLiteral = $report.containsStereotype($formula, "PDDL_Literal"))##
+## Numeric effects
+#set($isIncrease = $report.containsStereotype($formula, "PDDL_Increase"))##
+#set($isDecrease = $report.containsStereotype($formula, "PDDL_Decrease"))##
+#set($isAssign = $report.containsStereotype($formula, "PDDL_Assign"))##
+#set($isScaleUp = $report.containsStereotype($formula, "PDDL_ScaleUp"))##
+#set($isScaleDown = $report.containsStereotype($formula, "PDDL_ScaleDown"))##
+## Comparison and conditional formulas
+#set($isComparison = $report.containsStereotype($formula, "PDDL_Comparison"))##
+#set($isArith = $report.containsStereotype($formula, "PDDL_ArithmeticExpression"))##
+#set($isConditional = $report.containsStereotype($formula, "PDDL_ConditionalEffect"))##
+## Quantifiers
+#set($isExists = $report.containsStereotype($formula, "PDDL_Exists"))##
+#set($isForall = $report.containsStereotype($formula, "PDDL_Forall"))##
+##
+#if($isAnd && $formula.taggedValue)##
+#set($subs = [])##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operands")#set($subs = $tv.value)#end##
+#end##
+#end##
+#if($subs.size() < 2)##
+(UNKNOWN-AND-$formula.name)##
+#else##
+(and#foreach($sub in $subs) #formulaToPDDL($sub)#end)##
+#end##
+##
+#elseif($isOr && $formula.taggedValue)##
+#set($subs = [])##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operands")#set($subs = $tv.value)#end##
+#end##
+#end##
+#if($subs.size() < 2)##
+(UNKNOWN-OR-$formula.name)##
+#else##
+(or#foreach($sub in $subs) #formulaToPDDL($sub)#end)##
+#end##
+##
+#elseif($isNot && $formula.taggedValue)##
+#set($inner = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operand")#set($inner = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$inner)##
+(UNKNOWN-NOT-$formula.name)##
+#else##
+(not #formulaToPDDL($inner))##
+#end##
+##
+#elseif($isImply && $formula.taggedValue)##
+#set($implyCond = false)##
+#set($implyConseq = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "condition")#set($implyCond = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "consequence")#set($implyConseq = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$implyCond || !$implyConseq)##
+(UNKNOWN-IMPLY-$formula.name)##
+#else##
+## Velocity variables are global: a nested imply in the condition would
+## overwrite $implyConseq. The list is built before the recursive calls.
+(imply#foreach($imSub in [$implyCond, $implyConseq]) #formulaToPDDL($imSub)#end)##
+#end##
+##
+#elseif($isAtom)##
+#atomToPDDL($formula)##
+##
+#elseif($isFuncAtom)##
+#functionAtomToPDDL($formula)##
+##
+#elseif($isLiteral && $formula.taggedValue)##
+## The value goes straight into the output here, so it is checked before it
+## is written. A model element rather than a number would otherwise end up
+## in the file as a Java object reference.
+#set($litValue = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "value")#set($litValue = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$litValue)##
+(UNKNOWN-LITERAL-$formula.name)##
+#else##
+$litValue##
+#end##
+##
+## Numeric effects, pattern: (keyword (target-func) value-formula)
+## target -> reference to a PDDL_Function
+## value, factor or divisor -> a numeric term (PDDL_Formula element)
+## targetArguments -> arguments of the target function
+##
+#elseif($isIncrease && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neValue = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "value")#set($neValue = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neValue)##
+(UNKNOWN-INCREASE-$formula.name)##
+#else##
+(increase #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neValue))##
+#end##
+##
+#elseif($isDecrease && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neValue = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "value")#set($neValue = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neValue)##
+(UNKNOWN-DECREASE-$formula.name)##
+#else##
+(decrease #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neValue))##
+#end##
+##
+#elseif($isAssign && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neValue = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "value")#set($neValue = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neValue)##
+(UNKNOWN-ASSIGN-$formula.name)##
+#else##
+(assign #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neValue))##
+#end##
+##
+#elseif($isScaleUp && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neFactor = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "factor")#set($neFactor = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neFactor)##
+(UNKNOWN-SCALE-UP-$formula.name)##
+#else##
+(scale-up #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neFactor))##
+#end##
+##
+#elseif($isScaleDown && $formula.taggedValue)##
+#set($neTarget = false)##
+#set($neTArgs = [])##
+#set($neDivisor = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "target")#set($neTarget = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "targetArguments")#set($neTArgs = $tv.value)#end##
+#if($tv.tagDefinition.name == "divisor")#set($neDivisor = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$neTarget || !$neDivisor)##
+(UNKNOWN-SCALE-DOWN-$formula.name)##
+#else##
+(scale-down #functionRefToPDDL($neTarget $neTArgs $formula.name) #formulaToPDDL($neDivisor))##
+#end##
+##
+## Comparison, pattern: (operator left right)
+## operator -> a ComparisonOperator literal
+## left -> a PDDL_Formula element
+## right -> a PDDL_Formula element
+##
+#elseif($isComparison && $formula.taggedValue)##
+#set($cmpOp = false)##
+#set($cmpLeft = false)##
+#set($cmpRight = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operator")#set($cmpOp = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "left")#set($cmpLeft = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "right")#set($cmpRight = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$cmpOp || !$cmpLeft || !$cmpRight)##
+(UNKNOWN-COMPARISON-$formula.name)##
+#else##
+#set($cmpOpName = $cmpOp.name)##
+#if($cmpOpName == "equal")#set($cmpSymbol = "=")##
+#elseif($cmpOpName == "lessThan")#set($cmpSymbol = "<")##
+#elseif($cmpOpName == "greaterThan")#set($cmpSymbol = ">")##
+#elseif($cmpOpName == "lessOrEqual")#set($cmpSymbol = "<=")##
+#elseif($cmpOpName == "greaterOrEqual")#set($cmpSymbol = ">=")##
+#else#set($cmpSymbol = $cmpOpName)##
+#end##
+($cmpSymbol #formulaToPDDL($cmpLeft) #formulaToPDDL($cmpRight))##
+#end##
+##
+## Arithmetic expression, pattern: (op left right), op from ArithmeticOperator
+## (plus, minus, times, divide). Operands are built into a list before the
+## recursive calls, as for imply.
+##
+#elseif($isArith && $formula.taggedValue)##
+#set($arOp = false)##
+#set($arLeft = false)##
+#set($arRight = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "operator")#set($arOp = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "left")#set($arLeft = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "right")#set($arRight = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$arOp || !$arLeft || !$arRight)##
+(UNKNOWN-ARITHMETIC-$formula.name)##
+#else##
+#set($arOpName = $arOp.name)##
+#if($arOpName == "plus")#set($arSymbol = "+")##
+#elseif($arOpName == "minus")#set($arSymbol = "-")##
+#elseif($arOpName == "times")#set($arSymbol = "*")##
+#elseif($arOpName == "divide")#set($arSymbol = "/")##
+#else#set($arSymbol = "UNKNOWN-OPERATOR-$arOpName")##
+#end##
+($arSymbol#foreach($arSub in [$arLeft, $arRight]) #formulaToPDDL($arSub)#end)##
+#end##
+##
+## Conditional effect
+## Pattern: (when condition effect)
+##
+#elseif($isConditional && $formula.taggedValue)##
+#set($whenCond = false)##
+#set($whenEffect = false)##
+#foreach($tv in $formula.taggedValue)##
+#if($tv.tagDefinition && $tv.value && $tv.value.size() > 0)##
+#if($tv.tagDefinition.name == "condition")#set($whenCond = $tv.value.get(0))#end##
+#if($tv.tagDefinition.name == "effect")#set($whenEffect = $tv.value.get(0))#end##
+#end##
+#end##
+#if(!$whenCond || !$whenEffect)##
+(UNKNOWN-CONDITIONAL-$formula.name)##
+#else##
+## A single numeric effect gets the (and ...) wrapper, as the top-level effect does.##
+#set($numWhen = ($report.containsStereotype($whenEffect, "PDDL_Increase") || $report.containsStereotype($whenEffect, "PDDL_Decrease") || $report.containsStereotype($whenEffect, "PDDL_Assign") || $report.containsStereotype($whenEffect, "PDDL_ScaleUp") || $report.containsStereotype($whenEffect, "PDDL_ScaleDown")))##
+#if($numWhen)(when #formulaToPDDL($whenCond) (and #formulaToPDDL($whenEffect)))#{else}(when #formulaToPDDL($whenCond) #formulaToPDDL($whenEffect))#{end}##
+#end##
+##
+## Pattern: (exists/forall (?var1 - type1 ...) scope)
+## scope -> a PDDL_Formula element
+## variables -> a string list, inherited from the parent stereotype
+## variableTypes -> a list of PDDL_Type, inherited from the parent stereotype
+##
+#elseif($isExists && $formula.taggedValue)##
+## Read by name: if one of the three is missing, the indices shift and a
+## model element gets rendered where a variable name belongs.
+#set($qScope = false)##
+#set($qVars = [])##
+#set($qTypes = [])##
+#foreach($qtv in $formula.taggedValue)##
+#if($qtv.tagDefinition && $qtv.value && $qtv.value.size() > 0)##
+#if($qtv.tagDefinition.name == "scope")#set($qScope = $qtv.value.get(0))#end##
+#if($qtv.tagDefinition.name == "variables")#set($qVars = $qtv.value)#end##
+#if($qtv.tagDefinition.name == "variableTypes")#set($qTypes = $qtv.value)#end##
+#end##
+#end##
+## Without variables or a body this renders a marker, not PDDL.
+#if($qVars.size() == 0 || !$qScope)##
+(UNKNOWN-QUANTIFIER-$formula.name)##
+#else##
+(exists (#foreach($qv in $qVars)#set($qi = $foreach.index)$qv#if($qTypes.size() > $qi)#set($qtE = $qTypes.get($qi))#set($qtN = $qtE.typename)#if(!$qtN || $qtN == "")#set($qtN = $qtE.name)#end - $qtN.toLowerCase()#end#if($foreach.hasNext) #end#end) #formulaToPDDL($qScope))##
+#end##
+##
+#elseif($isForall && $formula.taggedValue)##
+## Read by name: if one of the three is missing, the indices shift and a
+## model element gets rendered where a variable name belongs.
+#set($qScope = false)##
+#set($qVars = [])##
+#set($qTypes = [])##
+#foreach($qtv in $formula.taggedValue)##
+#if($qtv.tagDefinition && $qtv.value && $qtv.value.size() > 0)##
+#if($qtv.tagDefinition.name == "scope")#set($qScope = $qtv.value.get(0))#end##
+#if($qtv.tagDefinition.name == "variables")#set($qVars = $qtv.value)#end##
+#if($qtv.tagDefinition.name == "variableTypes")#set($qTypes = $qtv.value)#end##
+#end##
+#end##
+## Without variables or a body this renders a marker, not PDDL.
+#if($qVars.size() == 0 || !$qScope)##
+(UNKNOWN-QUANTIFIER-$formula.name)##
+#else##
+## A single numeric effect as the body gets the (and ...) wrapper, as the top-level effect does.##
+#set($numScope = ($report.containsStereotype($qScope, "PDDL_Increase") || $report.containsStereotype($qScope, "PDDL_Decrease") || $report.containsStereotype($qScope, "PDDL_Assign") || $report.containsStereotype($qScope, "PDDL_ScaleUp") || $report.containsStereotype($qScope, "PDDL_ScaleDown")))##
+(forall (#foreach($qv in $qVars)#set($qi = $foreach.index)$qv#if($qTypes.size() > $qi)#set($qtE = $qTypes.get($qi))#set($qtN = $qtE.typename)#if(!$qtN || $qtN == "")#set($qtN = $qtE.name)#end - $qtN.toLowerCase()#end#if($foreach.hasNext) #end#end) #if($numScope)(and #formulaToPDDL($qScope))#{else}#formulaToPDDL($qScope)#{end})##
+#end##
+##
+## Unknown or incomplete formula stereotype: a visible marker instead of
+## empty output. VAL then reports an unknown predicate, so the mistake
+## surfaces.
+#else##
+(UNKNOWN-FORMULA-$formula.name)##
+#end##
+#end
+
+## -----------------------------------------------------------------------------
+## Mode A: read a boolean tag of a flow by name, result in $flowTagResult.
+## -----------------------------------------------------------------------------
+#macro(readFlowTag $edge $tagName)##
+#set($flowTagResult = false)##
+#if($edge.taggedValue)##
+#foreach($ftv in $edge.taggedValue)##
+#if($ftv.tagDefinition && $ftv.tagDefinition.name == $tagName && $ftv.value && $ftv.value.size() > 0)##
+#set($ftvRaw = $ftv.value.get(0))##
+#if($ftvRaw == true || $ftvRaw.toString() == "true")#set($flowTagResult = true)#end##
+#end##
+#end##
+#end##
+#end
+
+## -----------------------------------------------------------------------------
+## Mode A: read the tag 'arguments' of a predicate pin. Writes " ?a ?b"
+## (lower case, '?' added) to $pinArgsResult, "" without the tag.
+## -----------------------------------------------------------------------------
+#macro(readPinArgs $paPin)##
+#set($pinArgsResult = "")##
+#if($paPin.taggedValue)##
+#foreach($pav in $paPin.taggedValue)##
+#if($pav.tagDefinition && $pav.tagDefinition.name == "arguments" && $pav.value && $pav.value.size() > 0)##
+#foreach($pa1 in $pav.value)##
+#set($pa1s = $pa1.toString().trim().toLowerCase())##
+#if($pa1s.startsWith("?"))#set($pa1s = $pa1s.substring(1))#end##
+#set($pinArgsResult = "$pinArgsResult ?$pa1s")##
+#end##
+#end##
+#end##
+#end##
+#end
+##
+## -----------------------------------------------------------------------------
+## Mode A: build an atom from a predicate signal and bind its parameters.
+## Per predicate attribute, in this order: match by name against the action
+## parameters; match by type including the generalization chain up to the
+## root (first generalization, stops at a cycle); on ambiguity take the first
+## hit and warn; fall back to the attribute name and warn.
+## $maPTypeElems runs parallel to the parameter list and holds the pin type
+## elements, needed to walk up the generalization chain.
+## -----------------------------------------------------------------------------
+#macro(modusAAtom $maSig $maPNames $maPTypes $maPTypeElems $maBindWarn)##
+#set($maPredName = $maSig.predicatename)##
+#if(!$maPredName || $maPredName == "")#set($maPredName = $maSig.name)#end##
+($maPredName#modusABind($maSig $maPNames $maPTypes $maPTypeElems $maBindWarn "predicate '$maPredName'"))##
+#end
+##
+## -----------------------------------------------------------------------------
+## Mode A: build a function term from a function signal, same binding.
+## -----------------------------------------------------------------------------
+#macro(modusAFunc $maSig $maPNames $maPTypes $maPTypeElems $maBindWarn)##
+#set($maFuncName = "")##
+#set($maFuncName = $maSig.functionname)##
+#if(!$maFuncName || $maFuncName == "")#set($maFuncName = $maSig.name)#end##
+($maFuncName#modusABind($maSig $maPNames $maPTypes $maPTypeElems $maBindWarn "function '$maFuncName'"))##
+#end
+##
+## -----------------------------------------------------------------------------
+## Mode A: bind the attributes of a predicate or function signal to the action
+## parameters. $maLabel names the predicate or function in the warnings.
+## -----------------------------------------------------------------------------
+#macro(modusABind $maSig $maPNames $maPTypes $maPTypeElems $maBindWarn $maLabel)##
+#if($maSig.ownedAttribute)#foreach($maAttr in $maSig.ownedAttribute)#if($maAttr.name && $maAttr.type)#set($mbName = $maAttr.name.toLowerCase())#if($maPNames.contains($mbName)) ?$mbName#else#set($mbTypeName = $maAttr.type.typename)#if(!$mbTypeName || $mbTypeName == "")#set($mbTypeName = $maAttr.type.name)#end#set($mbTypeName = $mbTypeName.toLowerCase())#set($mbFound = "")#set($mbCount = 0)#if($maPNames.size() > 0)#foreach($mbCand in $maPNames)#set($mbIdx = $foreach.index)#set($mbMatch = false)#if($maPTypes.get($mbIdx) == $mbTypeName)#set($mbMatch = true)#else#set($mbTypeElem = $maPTypeElems.get($mbIdx))#if($mbTypeElem)#set($mbWalk = $mbTypeElem)#set($mbSeen = [])#foreach($mbStep in $elements)#if(!$mbWalk || $mbMatch || $mbSeen.contains($mbWalk))#break#end#set($dummy = $mbSeen.add($mbWalk))#if($mbWalk.general && $mbWalk.general.size() > 0)#set($mbWalk = $mbWalk.general.get(0))#set($mbGName = "")#set($mbGName = $mbWalk.typename)#if(!$mbGName || $mbGName == "")#set($mbGName = $mbWalk.name)#end#if($mbGName.toLowerCase() == $mbTypeName)#set($mbMatch = true)#end#else#set($mbWalk = false)#end#end#end#end#if($mbMatch)#if($mbCount == 0)#set($mbFound = $mbCand)#end#set($mbCount = $mbCount + 1)#end#end#end#if($mbFound != "")#if($mbCount > 1)#set($dummy = $maBindWarn.add("ambiguous binding: $maLabel attribute '$mbName' (type $mbTypeName) matches $mbCount parameters, using ?$mbFound"))#end ?$mbFound#else#set($dummy = $maBindWarn.add("no parameter match for $maLabel attribute '$mbName' (type $mbTypeName), using attribute name"))#end#if($mbFound == "") ?$mbName#end#end#end#end#end##
+#end
+##
+## -----------------------------------------------------------------------------
+## Mode A: read the numeric tags of a function pin by name. Sets $fpCmp, $fpEff
+## (enumeration literal or false), $fpVal + $fpHasVal, $fpOpd + $fpHasOpd.
+## -----------------------------------------------------------------------------
+#macro(readNumTags $nPin)##
+#set($fpCmp = false)##
+#set($fpEff = false)##
+#set($fpVal = "")##
+#set($fpHasVal = false)##
+#set($fpOpd = false)##
+#set($fpHasOpd = false)##
+#if($nPin.taggedValue)#foreach($ntv in $nPin.taggedValue)#if($ntv.tagDefinition && $ntv.value && $ntv.value.size() > 0)##
+#if($ntv.tagDefinition.name == "comparison")#set($fpCmp = $ntv.value.get(0))#end##
+#if($ntv.tagDefinition.name == "numericEffect")#set($fpEff = $ntv.value.get(0))#end##
+#if($ntv.tagDefinition.name == "numericValue")#set($fpVal = $ntv.value.get(0))#set($fpHasVal = true)#end##
+#if($ntv.tagDefinition.name == "numericOperand")#set($fpOpd = $ntv.value.get(0))#set($fpHasOpd = true)#end##
+#end#end#end##
+#end
+
+## More than one domain package under the start element would mix both into one file.
+#set($pddlDomain = false)
+#set($domainPackages = [])
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Domain"))
+#set($pddlDomain = $elem)
+#set($dummy = $domainPackages.add($elem.name))
+#end
+#end
+
+#if(!$pddlDomain)
+;; ERROR: No PDDL_Domain found
+#elseif($domainPackages.size() > 1)
+;; ERROR: $domainPackages.size() packages with PDDL_Domain under the start element $domainPackages. Start the report at one of them.
+#else
+
+#set($domainName = $pddlDomain.domainname)
+#if(!$domainName || $domainName == "")
+#set($domainName = $pddlDomain.name.toLowerCase().replaceAll(" ", "_"))
+#end
+(define (domain $domainName)
+
+## Determine whether functions exist before writing the requirements
+#set($hasFunctions = false)
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Function"))
+#set($hasFunctions = true)
+#end
+#end
+
+## -----------------------------------------------------------------------------
+## Macro: derive requirements from a formula (recursive).
+## $rsWo: "pre" for conditions, "eff" for effects. Sets $reqOr, $reqEx, $reqFa, $reqWhen, $reqNeg.
+## $rsN is global: it is read in the if/elseif before the recursive call and not afterwards.
+## -----------------------------------------------------------------------------
+#macro(reqScan $rsF $rsWo)##
+#if($report.containsStereotype($rsF, "PDDL_Or") || $report.containsStereotype($rsF, "PDDL_Imply"))#set($reqOr = true)#end##
+#if($report.containsStereotype($rsF, "PDDL_Exists"))#set($reqEx = true)#end##
+#if($report.containsStereotype($rsF, "PDDL_Forall"))#if($rsWo == "eff")#set($reqWhen = true)#else#set($reqFa = true)#end#end##
+#if($report.containsStereotype($rsF, "PDDL_ConditionalEffect"))#set($reqWhen = true)#end##
+#if($report.containsStereotype($rsF, "PDDL_Not") && $rsWo != "eff")##
+#foreach($rsNt in $rsF.taggedValue)#if($rsNt.tagDefinition && $rsNt.tagDefinition.name == "operand" && $rsNt.value && $rsNt.value.size() > 0)#if(!$report.containsStereotype($rsNt.value.get(0), "PDDL_PredicateAtom"))#set($reqOr = true)#else#set($reqNeg = true)#end#end#end##
+#end##
+#foreach($rsTv in $rsF.taggedValue)#if($rsTv.tagDefinition && $rsTv.value && $rsTv.value.size() > 0)##
+#set($rsN = $rsTv.tagDefinition.name)##
+#if($rsN == "condition")#foreach($rsK in $rsTv.value)#reqScan($rsK "pre")#end##
+#elseif($rsN == "operands" || $rsN == "operand" || $rsN == "scope" || $rsN == "consequence" || $rsN == "effect")#foreach($rsK in $rsTv.value)#reqScan($rsK $rsWo)#end##
+#end##
+#end#end##
+#end
+
+## -----------------------------------------------------------------------------
+## Macros: check for action costs. They set $acOk = false as soon as something does not fit; $acTc is the
+## function total-cost without parameters. acValue: amount of an increase (formula: literal >= 0 or function
+## atom of another function; number: >= 0). acEffect: numeric effect, only increase on total-cost is allowed.
+## acScan: formula tree (no comparison allowed, numeric effects checked), children as in reqScan.
+## -----------------------------------------------------------------------------
+#macro(acValue $acW $acIsFormula)##
+#if($acIsFormula)##
+#if($report.containsStereotype($acW, "PDDL_Literal"))##
+#set($acLit = "")#foreach($acLv in $acW.taggedValue)#if($acLv.tagDefinition && $acLv.tagDefinition.name == "value" && $acLv.value && $acLv.value.size() > 0)#set($acLit = "$acLv.value.get(0)")#end#end##
+#if($acLit.trim() == "" || $acLit.trim().startsWith("-"))#set($acOk = false)#end##
+#elseif($report.containsStereotype($acW, "PDDL_FunctionAtom"))##
+#set($acFn = false)#foreach($acLv in $acW.taggedValue)#if($acLv.tagDefinition && $acLv.tagDefinition.name == "function" && $acLv.value && $acLv.value.size() > 0)#set($acFn = $acLv.value.get(0))#end#end##
+#if(!$acFn || $acFn == $acTc)#set($acOk = false)#end##
+#else#set($acOk = false)#end##
+#else##
+#set($acNumber = "$acW")##
+#if($acNumber.trim().startsWith("-"))#set($acOk = false)#end##
+#end##
+#end
+#macro(acEffect $acTarget $acOp $acW $acIsFormula)##
+#if($acTc && $acTarget == $acTc)#set($acHatTc = true)#end##
+#if(!$acTc || $acTarget != $acTc || $acOp != "increase")#set($acOk = false)#else#acValue($acW $acIsFormula)#end##
+#end
+#macro(acScan $acF)##
+#if($report.containsStereotype($acF, "PDDL_Comparison"))#set($acOk = false)#end##
+#set($acOpN = "")##
+#if($report.containsStereotype($acF, "PDDL_Increase"))#set($acOpN = "increase")#elseif($report.containsStereotype($acF, "PDDL_Decrease") || $report.containsStereotype($acF, "PDDL_Assign") || $report.containsStereotype($acF, "PDDL_ScaleUp") || $report.containsStereotype($acF, "PDDL_ScaleDown"))#set($acOpN = "other")#end##
+#if($acOpN != "")##
+#set($acT = false)#set($acV = false)##
+#foreach($acTv in $acF.taggedValue)#if($acTv.tagDefinition && $acTv.value && $acTv.value.size() > 0)#if($acTv.tagDefinition.name == "target")#set($acT = $acTv.value.get(0))#end#if($acTv.tagDefinition.name == "value")#set($acV = $acTv.value.get(0))#end#end#end##
+#if(!$acT || !$acV)#set($acOk = false)#else#acEffect($acT $acOpN $acV true)#end##
+#end##
+#foreach($acTv in $acF.taggedValue)#if($acTv.tagDefinition && $acTv.value && $acTv.value.size() > 0)##
+#set($acN = $acTv.tagDefinition.name)##
+#if($acN == "condition" || $acN == "operands" || $acN == "operand" || $acN == "scope" || $acN == "consequence" || $acN == "effect")#foreach($acK in $acTv.value)#acScan($acK)#end#end##
+#end#end##
+#end
+## Requirements: the entries of the tag (enumeration literals), plus the base and what the constructs need
+#set($reqList = $pddlDomain.requirements)
+#set($requirements = "")
+#if($reqList && $reqList.size() > 0)
+#foreach($req in $reqList)
+## Accepts both an enumeration literal and a plain string, and tolerates a
+## leading colon in case the model spells the requirement that way.
+#if($req.name)#set($reqName = $req.name)#else#set($reqName = "$req")#end
+#set($reqName = $reqName.toLowerCase().replaceAll("^:", ""))
+#set($requirements = "$requirements :$reqName")
+#end
+#end
+## Always derived from what the formulas of the actions and the goal formula of the problem use, following
+## the requirement flags of the PDDL 2.1 BNF. The entries of the tag come first. What the tag already names
+## or covers (:quantified-preconditions) is not repeated.
+#set($reqOr = false)#set($reqEx = false)#set($reqFa = false)#set($reqWhen = false)#set($reqNeg = false)
+## Per action name only the first call counts, as when the actions are generated; the goal formula of the
+## problem always.
+#set($rqScanSeen = [])
+#foreach($rqElem in $elements)
+#set($rqLesen = false)
+#if($rqElem.taggedValue && $report.containsStereotype($rqElem, "PDDL_Problem"))#set($rqLesen = true)#end
+#if($rqElem.taggedValue && $report.containsStereotype($rqElem, "PDDL_Action"))
+#set($rqName = $rqElem.actionname)
+#if(!$rqName || $rqName == "")#set($rqName = $rqElem.name)#end
+#if($rqName && $rqName != "" && !$rqScanSeen.contains($rqName))#set($dummy = $rqScanSeen.add($rqName))#set($rqLesen = true)#end
+#end
+#if($rqLesen)
+#foreach($rqTv in $rqElem.taggedValue)
+#if($rqTv.tagDefinition && $rqTv.value && $rqTv.value.size() > 0)
+#if($rqTv.tagDefinition.name == "precondition" || $rqTv.tagDefinition.name == "goal")#reqScan($rqTv.value.get(0) "pre")#elseif($rqTv.tagDefinition.name == "effect")#reqScan($rqTv.value.get(0) "eff")#end
+#end
+#end
+#end
+#end
+## Negated conditions from Mode A (input pin of a predicate with isNegated, on the incoming flow or on the
+## pin; the pin wins) and from goal facts of the problem with isNegated and a predicate as supplier.
+#set($rqNegSeen = [])
+#foreach($rqElem in $elements)
+#if($report.containsStereotype($rqElem, "PDDL_Action"))
+#set($rqName = $rqElem.actionname)
+#if(!$rqName || $rqName == "")#set($rqName = $rqElem.name)#end
+#if($rqName && $rqName != "" && !$rqNegSeen.contains($rqName))
+#set($dummy = $rqNegSeen.add($rqName))
+#set($rqModeB = false)
+#if($rqElem.taggedValue)#foreach($rqTv in $rqElem.taggedValue)#if($rqTv.tagDefinition && ($rqTv.tagDefinition.name == "precondition" || $rqTv.tagDefinition.name == "effect") && $rqTv.value && $rqTv.value.size() > 0)#set($rqModeB = true)#end#end#end
+#if(!$rqModeB && $rqElem.input)
+#foreach($rqPin in $rqElem.input)
+#if($rqPin.type && $report.containsStereotype($rqPin.type, "PDDL_Predicate"))
+#set($rqPinNeg = false)
+#if($rqPin.incoming && $rqPin.incoming.size() > 0)#set($rqEdge = $rqPin.incoming.get(0))#readFlowTag($rqEdge "isNegated")#set($rqPinNeg = $flowTagResult)#end
+#if($report.containsStereotype($rqPin, "PDDL_PinAnnotation"))#readFlowTag($rqPin "isNegated")#set($rqPinNeg = $flowTagResult)#end
+#if($rqPinNeg)#set($reqNeg = true)#end
+#end
+#end
+#end
+#end
+#end
+#if($report.containsStereotype($rqElem, "PDDL_GoalState") && $rqElem.supplier && $rqElem.supplier.size() > 0 && $report.containsStereotype($rqElem.supplier.get(0), "PDDL_Predicate"))
+#readFlowTag($rqElem "isNegated")
+#if($flowTagResult)#set($reqNeg = true)#end
+#end
+#end
+#set($reqTag = "$requirements ")
+#set($reqQuant = $reqTag.contains(" :quantified-preconditions "))
+#if(!$reqTag.contains(" :strips "))#set($requirements = "$requirements :strips")#end
+#if(!$reqTag.contains(" :typing "))#set($requirements = "$requirements :typing")#end
+#if($reqNeg && !$reqTag.contains(" :negative-preconditions "))#set($requirements = "$requirements :negative-preconditions")#end
+#if($reqOr && !$reqTag.contains(" :disjunctive-preconditions "))#set($requirements = "$requirements :disjunctive-preconditions")#end
+#if($reqEx && !$reqQuant && !$reqTag.contains(" :existential-preconditions "))#set($requirements = "$requirements :existential-preconditions")#end
+#if($reqFa && !$reqQuant && !$reqTag.contains(" :universal-preconditions "))#set($requirements = "$requirements :universal-preconditions")#end
+#if($reqWhen && !$reqTag.contains(" :conditional-effects "))#set($requirements = "$requirements :conditional-effects")#end
+## Requirement of the functions: :action-costs if the functions carry only action costs (total-cost without
+## parameters, only increased by a number >= 0 or by another function, no comparison, no other function
+## changed, the metric minimizes total-cost), otherwise :numeric-fluents. Added when the tag does not cover it.
+#set($acOk = false)
+#if($hasFunctions)
+#set($acOk = true)
+#set($acTc = false)
+#set($acMetric = false)
+#foreach($acE in $elements)
+#if($report.containsStereotype($acE, "PDDL_Function"))
+#set($acFName = $acE.functionname)
+#if(!$acFName || $acFName == "")#set($acFName = $acE.name)#end
+#set($acAr = 0)
+#if($acE.ownedAttribute)#foreach($acA in $acE.ownedAttribute)#if($acA.name && $acA.type)#set($acAr = $acAr + 1)#end#end#end
+#if($acFName && $acFName.toLowerCase() == "total-cost" && $acAr == 0)#set($acTc = $acE)#end
+#end
+#end
+#if(!$acTc)#set($acOk = false)#end
+#set($acSeen = [])
+#foreach($acE in $elements)
+#if($acOk && $report.containsStereotype($acE, "PDDL_Action"))
+#set($acName = $acE.actionname)
+#if(!$acName || $acName == "")#set($acName = $acE.name)#end
+#if($acName && $acName != "" && !$acSeen.contains($acName))
+#set($dummy = $acSeen.add($acName))
+#set($acModeB = false)
+#set($acHatTc = false)
+#if($acE.taggedValue)#foreach($acTv0 in $acE.taggedValue)#if($acTv0.tagDefinition && ($acTv0.tagDefinition.name == "precondition" || $acTv0.tagDefinition.name == "effect") && $acTv0.value && $acTv0.value.size() > 0)#set($acModeB = true)#acScan($acTv0.value.get(0))#end#end#end
+#if(!$acModeB)
+#if($acE.input)#foreach($acP in $acE.input)#if($acP.type && $report.containsStereotype($acP.type, "PDDL_Function"))#readNumTags($acP)#if($fpCmp)#set($acOk = false)#end#end#end#end
+#if($acE.output)#foreach($acP in $acE.output)#if($acP.type && $report.containsStereotype($acP.type, "PDDL_Function"))#readNumTags($acP)#if($fpEff)#set($acEffName = $fpEff.name)#set($acTargetP = $acP.type)#if($fpHasOpd)#set($acValueP = $fpOpd)#acEffect($acTargetP $acEffName $acValueP true)#elseif($fpHasVal)#set($acValueP = $fpVal)#acEffect($acTargetP $acEffName $acValueP false)#end#end#end#end#end
+#end
+## The tag 'cost' counts as an increase of total-cost by a number, unless the action changes total-cost itself
+## (then its own effect counts, as when the action is generated)
+#set($acKost = "")#if($acE.taggedValue)#foreach($acTv0 in $acE.taggedValue)#if($acTv0.tagDefinition && $acTv0.tagDefinition.name == "cost" && $acTv0.value && $acTv0.value.size() > 0)#set($acKost = "$acTv0.value.get(0)")#end#end#end
+#if($acKost != "" && !$acHatTc)#acEffect($acTc "increase" $acKost false)#end
+#end
+#end
+#if($report.containsStereotype($acE, "PDDL_Problem"))
+#set($acMetric = true)
+#if($acE.taggedValue)#foreach($acTv0 in $acE.taggedValue)#if($acTv0.tagDefinition && $acTv0.tagDefinition.name == "goal" && $acTv0.value && $acTv0.value.size() > 0)#acScan($acTv0.value.get(0))#end#end#end
+#set($acMd = $acE.metricdirection)
+#set($acMx = $acE.metricexpression)
+#if(!$acMd || !$acMx)#set($acOk = false)#else
+#set($acMxS = "$acMx")
+#if($acMxS.trim().toLowerCase() != "total-cost")#set($acOk = false)#end
+#if($acMd.name && $acMd.name.toLowerCase() != "minimize")#set($acOk = false)#end
+#end
+#end
+#if($report.containsStereotype($acE, "PDDL_GoalState") && $acE.supplier && $acE.supplier.size() > 0 && $report.containsStereotype($acE.supplier.get(0), "PDDL_Function"))#set($acOk = false)#end
+#end
+#if(!$acMetric)#set($acOk = false)#end
+#if($acOk)
+#if(!$requirements.contains("fluents") && !$requirements.contains("action-costs"))#set($requirements = "$requirements :action-costs")#end
+#else
+#if(!$requirements.contains("fluents"))#set($requirements = "$requirements :numeric-fluents")#end
+#end
+#end
+  (:requirements$requirements)
+## Entries of the tag that no construct needs get a warning comment (:strips and :typing never;
+## :action-costs is needed when the functions carry only action costs, :numeric-fluents when they carry more).
+#foreach($rqT in $reqTag.trim().split(" "))
+#set($rqU = true)
+#if($rqT == ":negative-preconditions" && !$reqNeg)#set($rqU = false)#end
+#if($rqT == ":disjunctive-preconditions" && !$reqOr)#set($rqU = false)#end
+#if($rqT == ":existential-preconditions" && !$reqEx)#set($rqU = false)#end
+#if($rqT == ":universal-preconditions" && !$reqFa)#set($rqU = false)#end
+#if($rqT == ":quantified-preconditions" && !$reqEx && !$reqFa)#set($rqU = false)#end
+#if($rqT == ":conditional-effects" && !$reqWhen)#set($rqU = false)#end
+#if($rqT == ":numeric-fluents" && (!$hasFunctions || $acOk))#set($rqU = false)#end
+#if($rqT == ":action-costs" && !$acOk)#set($rqU = false)#end
+#if($rqT == ":equality" || $rqT == ":durative-actions" || $rqT == ":duration-inequalities" || $rqT == ":continuous-effects")#set($rqU = false)#end
+#if($rqT == ":derived-predicates" || $rqT == ":timed-initial-literals" || $rqT == ":preferences" || $rqT == ":constraints")#set($rqU = false)#end
+#if(!$rqU)
+  ;; WARN requirement '$rqT' is set in the tag 'requirements', but no construct of the domain or of the goal needs it. A planner that does not support it may reject the domain.
+#end
+#end
+
+  (:types
+## Pass 1: base types, written with an explicit - object
+#set($baseTypes = [])
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Type"))
+#if(!$elem.general || $elem.general.size() == 0)
+#set($typeName = $elem.typename)
+#if(!$typeName || $typeName == "")#set($typeName = $elem.name)#end
+#set($dummy = $baseTypes.add($typeName.toLowerCase()))
+#end
+#end
+#end
+#if($baseTypes.size() > 0)
+    #foreach($bt in $baseTypes)$bt #end- object
+#end
+## Pass 2: derived types
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Type"))
+#if($elem.general && $elem.general.size() > 0)
+#set($typeName = $elem.typename)
+#if(!$typeName || $typeName == "")#set($typeName = $elem.name)#end
+#set($parent = $elem.general.get(0))
+#set($parentTypeName = $parent.typename)
+#if(!$parentTypeName || $parentTypeName == "")#set($parentTypeName = $parent.name)#end
+    $typeName.toLowerCase() - $parentTypeName.toLowerCase()
+#end
+#end
+#end
+  )
+## -----------------------------------------------------------------------------
+## Constants: name from constantName (otherwise the element name), type from
+## typeRef (otherwise the first classifier, otherwise object). Equal names are
+## written once. Without <<PDDL_Constant>> no block is written.
+## -----------------------------------------------------------------------------
+#set($constEntries = [])
+#set($constSeen = [])
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Constant"))
+#set($cName = "")
+#set($cName = $elem.constantname)
+#if(!$cName || $cName == "")#set($cName = $elem.name)#end
+#set($cTypeElem = false)
+#if($elem.taggedValue)
+#foreach($tv in $elem.taggedValue)
+#if($tv.tagDefinition && $tv.tagDefinition.name == "typeRef" && $tv.value && $tv.value.size() > 0)#set($cTypeElem = $tv.value.get(0))#end
+#end
+#end
+#if(!$cTypeElem && $elem.classifier && $elem.classifier.size() > 0)#set($cTypeElem = $elem.classifier.get(0))#end
+#set($cType = "object")
+#if($cTypeElem)
+#set($cType = "")
+#set($cType = $cTypeElem.typename)
+#if(!$cType || $cType == "")#set($cType = $cTypeElem.name)#end
+#end
+#if(!$constSeen.contains($cName))
+#set($dummy = $constSeen.add($cName))
+#set($dummy = $constEntries.add("$cName - $cType.toLowerCase()"))
+#end
+#end
+#end
+#if($constEntries.size() > 0)
+
+  (:constants
+#foreach($ce in $constEntries)
+    $ce
+#end
+  )
+#end
+
+  (:predicates
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Predicate"))
+#set($predName = $elem.predicatename)
+#if(!$predName || $predName == "")#set($predName = $elem.name)#end
+#set($params = "")
+#if($elem.ownedAttribute)
+#foreach($attr in $elem.ownedAttribute)
+#if($attr.name && $attr.type)
+## Type name: typename if set, otherwise the SysML element name
+#set($attrTypeName = $attr.type.typename)
+#if(!$attrTypeName || $attrTypeName == "")#set($attrTypeName = $attr.type.name)#end
+#set($params = "$params ?$attr.name.toLowerCase() - $attrTypeName.toLowerCase()")
+#end
+#end
+#end
+    ($predName$params)
+#end
+#end
+  )
+
+#if($hasFunctions)
+
+  (:functions
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Function"))
+#set($funcName = $elem.functionname)
+#if(!$funcName || $funcName == "")#set($funcName = $elem.name)#end
+#set($funcReturnType = $elem.returntype)
+#if(!$funcReturnType || $funcReturnType == "")#set($funcReturnType = "number")#end
+## Parameters from the signal attributes, as for predicates
+#set($funcParams = "")
+#if($elem.ownedAttribute)
+#foreach($attr in $elem.ownedAttribute)
+#if($attr.name && $attr.type)
+#set($attrTypeName = $attr.type.typename)
+#if(!$attrTypeName || $attrTypeName == "")#set($attrTypeName = $attr.type.name)#end
+#set($funcParams = "$funcParams ?$attr.name.toLowerCase() - $attrTypeName.toLowerCase()")
+#end
+#end
+#end
+    ($funcName$funcParams) - $funcReturnType
+#end
+#end
+  )
+#end
+
+## Durative guard, second half: reports durative actions that the action
+## branch above does not reach.
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_DurativeAction") && !$report.containsStereotype($elem, "PDDL_Action"))
+  ;; WARN durative action '$elem.name' skipped: :durative-actions are not supported by this template (PDDL 2.1 Level 1+2); no action generated. Remodel it as <<PDDL_Action>> (instantaneous) to plan it.
+#end
+#end
+#set($processedActions = [])
+## The function total-cost without parameters, needed for the tag 'cost'
+#set($costTc = false)#set($costTcName = "")
+#foreach($ctE in $elements)#if($report.containsStereotype($ctE, "PDDL_Function"))#set($ctN = "")#set($ctN = $ctE.functionname)#if(!$ctN || $ctN == "")#set($ctN = $ctE.name)#end#set($ctAr = 0)#if($ctE.ownedAttribute)#foreach($ctA in $ctE.ownedAttribute)#if($ctA.name && $ctA.type)#set($ctAr = $ctAr + 1)#end#end#end#if($ctN && $ctN.toLowerCase() == "total-cost" && $ctAr == 0)#set($costTc = $ctE)#set($costTcName = $ctN)#end#end#end
+#set($actionSigs = [])
+#foreach($elem in $elements)
+#if($report.containsStereotype($elem, "PDDL_Action"))
+#set($actionName = $elem.actionname)
+#if(!$actionName || $actionName == "")#set($actionName = $elem.name)#end
+#if($actionName && $actionName != "")
+## =============================================================
+## Build the signature before deduplicating.
+## Several call behavior actions may invoke the same PDDL action, because a
+## process calls the same operation in more than one place. Only one of those
+## calls can determine the action schema, and that is a problem when the calls
+## do not mean the same thing: predicate pins and the tags precondition and
+## effect hang on the call, not on the behavior being called. Two calls of the
+## same behavior can therefore carry different pre- and postconditions.
+## The signature covers everything that shapes the generated schema: pin
+## name, pin type, pin annotations and the formula tags. Matching calls give
+## no message, differing ones a warning in the output.
+## =============================================================
+#set($sig = "")
+#if($elem.input)
+#foreach($sp in $elem.input)
+#if($sp.type)
+#set($spAnn = "")
+#if($report.containsStereotype($sp, "PDDL_PinAnnotation"))
+#readFlowTag($sp "isNegated")
+#set($spAnn = "${spAnn}/n=$flowTagResult")
+#readFlowTag($sp "isPreserved")
+#set($spAnn = "${spAnn}/p=$flowTagResult")
+#readPinArgs($sp)
+#if($pinArgsResult != "")#set($spAnn = "${spAnn}/a=$pinArgsResult")#end
+#end
+#if($report.containsStereotype($sp.type, "PDDL_Function"))#readNumTags($sp)#set($spAnn = "${spAnn}/num")#if($fpCmp)#set($spAnn = "${spAnn}/c=$fpCmp.name")#end#if($fpHasVal)#set($spAnn = "${spAnn}/v=$fpVal")#end#if($fpOpd)#set($spAnn = "${spAnn}/o=$fpOpd.name")#end#end
+#set($sig = "${sig}[in ${sp.name}:${sp.type.name}${spAnn}]")
+#end
+#end
+#end
+#if($elem.output)
+#foreach($sp in $elem.output)
+#if($sp.type)
+#set($spAnn = "")
+#if($report.containsStereotype($sp, "PDDL_PinAnnotation"))
+#readFlowTag($sp "isNegated")
+#set($spAnn = "${spAnn}/n=$flowTagResult")
+#readPinArgs($sp)
+#if($pinArgsResult != "")#set($spAnn = "${spAnn}/a=$pinArgsResult")#end
+#end
+#if($report.containsStereotype($sp.type, "PDDL_Function"))#readNumTags($sp)#set($spAnn = "${spAnn}/num")#if($fpEff)#set($spAnn = "${spAnn}/e=$fpEff.name")#end#if($fpHasVal)#set($spAnn = "${spAnn}/v=$fpVal")#end#if($fpOpd)#set($spAnn = "${spAnn}/o=$fpOpd.name")#end#end
+#set($sig = "${sig}[out ${sp.name}:${sp.type.name}${spAnn}]")
+#end
+#end
+#end
+## Mode B: the referenced formula element identifies the semantics
+#foreach($stv in $elem.taggedValue)
+#if($stv.tagDefinition && ($stv.tagDefinition.name == "precondition" || $stv.tagDefinition.name == "effect") && $stv.value && $stv.value.size() > 0)
+#set($sig = "${sig}[${stv.tagDefinition.name}=${stv.value.get(0).name}]")
+#end
+#if($stv.tagDefinition && $stv.tagDefinition.name == "cost" && $stv.value && $stv.value.size() > 0)#set($sig = "${sig}[cost=${stv.value.get(0)}]")#end
+#end
+#if(!$processedActions.contains($actionName))
+#set($dummy = $processedActions.add($actionName))
+#set($dummy = $actionSigs.add($sig))
+#set($actionComments = [])
+## Durative guard, first half: if a durative action does reach the action
+## branch through stereotype inheritance, it is rendered as instantaneous.
+## The temporal semantics would be lost, so it is reported here.
+#if($report.containsStereotype($elem, "PDDL_DurativeAction"))
+#set($dummy = $actionComments.add("WARN action '$actionName' is annotated <<PDDL_DurativeAction>>, but this template does not generate :durative-actions (PDDL 2.1 levels 1 and 2 only). Duration and durationType are dropped, and the action is rendered as instantaneous."))
+#end
+## =============================================================
+## Collect parameters from input and output pins, deduplicated. Output pin
+## names are normalized: "assemblyOut" becomes "assembly". Predicate pins are
+## not parameters and are collected separately for Mode A.
+## $seenParamTypes runs parallel to $seenParams for the type binding.
+## =============================================================
+#set($paramStr = "")
+#set($seenParams = [])
+#set($seenParamTypes = [])
+#set($seenParamTypeElems = [])
+## Mode A collections
+#set($inPredNames = [])
+#set($inPredSignals = [])
+#set($inPredNeg = [])
+#set($inPredPres = [])
+#set($outPredNames = [])
+#set($outPredSignals = [])
+#set($outNegSignals = [])
+## arguments per predicate pin (tag 'arguments'), "" without the tag; parallel lists
+#set($inPredArgs = [])
+#set($outPredArgs = [])
+#set($outNegArgs = [])
+#set($outNegNames = [])
+## function pins (Mode A), parallel lists per direction
+#set($inFuncSignals = [])
+#set($inFuncSyms = [])
+#set($inFuncVals = [])
+#set($inFuncOpds = [])
+#set($outFuncSignals = [])
+#set($outFuncSyms = [])
+#set($outFuncVals = [])
+#set($outFuncOpds = [])
+## Input pins
+#if($elem.input)
+#foreach($pin in $elem.input)
+#if($pin.type)
+#if($report.containsStereotype($pin.type, "PDDL_Predicate"))
+## Predicate pin, incoming
+#set($paSig = $pin.type)
+#set($paName = $paSig.predicatename)
+#if(!$paName || $paName == "")#set($paName = $paSig.name)#end
+#set($paNeg = false)
+#set($paPres = false)
+#if($pin.incoming && $pin.incoming.size() > 0)
+#set($paEdge = $pin.incoming.get(0))
+#readFlowTag($paEdge "isNegated")
+#set($paNeg = $flowTagResult)
+#readFlowTag($paEdge "isPreserved")
+#set($paPres = $flowTagResult)
+#end
+## Tags directly on the pin via <<PDDL_PinAnnotation>>, used when no annotated
+## object flow is modeled and taking precedence when both are. readFlowTag
+## reads taggedValue generically and therefore works on a pin as well.
+#set($paArgs = "")
+#if($report.containsStereotype($pin, "PDDL_PinAnnotation"))
+#readFlowTag($pin "isNegated")
+#set($paNeg = $flowTagResult)
+#readFlowTag($pin "isPreserved")
+#set($paPres = $flowTagResult)
+#readPinArgs($pin)
+#set($paArgs = $pinArgsResult)
+#end
+#set($dummy = $inPredArgs.add($paArgs))
+#set($dummy = $inPredNames.add($paName))
+#set($dummy = $inPredSignals.add($paSig))
+#set($dummy = $inPredNeg.add($paNeg))
+#set($dummy = $inPredPres.add($paPres))
+#elseif($report.containsStereotype($pin.type, "PDDL_Type"))
+## Only pins typed with a <<PDDL_Type>> are parameters (see the header).
+#set($pinName = $pin.name.toLowerCase())
+#if(!$seenParams.contains($pinName))
+#set($dummy = $seenParams.add($pinName))
+#set($pinTypeName = $pin.type.typename)
+#if(!$pinTypeName || $pinTypeName == "")#set($pinTypeName = $pin.type.name)#end
+#set($dummy = $seenParamTypes.add($pinTypeName.toLowerCase()))
+#set($dummy = $seenParamTypeElems.add($pin.type))
+#set($paramStr = "$paramStr ?$pinName - $pinTypeName.toLowerCase() ")
+#end
+#elseif($report.containsStereotype($pin.type, "PDDL_Function"))
+## Function pin with 'comparison' -> precondition (op (f args) rhs). Without a
+## comparison or without exactly one right-hand side: note, not transformed.
+#readNumTags($pin)
+#if(!$fpCmp)
+#set($dummy = $actionComments.add("WARN input pin '$pin.name' is typed with <<PDDL_Function>> '$pin.type.name' but has no 'comparison'. Pin not transformed. Set comparison and numericValue or numericOperand (<<PDDL_PinAnnotation>>, Mode A) or reference the function in formulas (Mode B)"))
+#elseif($fpHasVal == $fpHasOpd)
+#set($dummy = $actionComments.add("WARN input pin '$pin.name' (function '$pin.type.name'): 'comparison' needs exactly one of numericValue and numericOperand. Pin not transformed"))
+#else
+#set($fpSym = $fpCmp.name)
+#if($fpSym == "equal")#set($fpSym = "=")#elseif($fpSym == "lessThan")#set($fpSym = "<")#elseif($fpSym == "greaterThan")#set($fpSym = ">")#elseif($fpSym == "lessOrEqual")#set($fpSym = "<=")#elseif($fpSym == "greaterOrEqual")#set($fpSym = ">=")#end
+#set($dummy = $inFuncSignals.add($pin.type))
+#set($dummy = $inFuncSyms.add($fpSym))
+#set($dummy = $inFuncVals.add("$fpVal"))
+#set($dummy = $inFuncOpds.add($fpOpd))
+#end
+#end
+#end
+#end
+#end
+## Output pins, with name normalization
+#if($elem.output)
+#foreach($pin in $elem.output)
+#if($pin.type)
+#if($report.containsStereotype($pin.type, "PDDL_Predicate"))
+## Predicate pin, outgoing
+#set($paSig = $pin.type)
+#set($paName = $paSig.predicatename)
+#if(!$paName || $paName == "")#set($paName = $paSig.name)#end
+#set($paNeg = false)
+#if($pin.outgoing && $pin.outgoing.size() > 0)
+#set($paEdge = $pin.outgoing.get(0))
+#readFlowTag($paEdge "isNegated")
+#set($paNeg = $flowTagResult)
+#end
+## isNegated and arguments directly on the output pin
+#set($paArgs = "")
+#if($report.containsStereotype($pin, "PDDL_PinAnnotation"))
+#readFlowTag($pin "isNegated")
+#set($paNeg = $flowTagResult)
+#readPinArgs($pin)
+#set($paArgs = $pinArgsResult)
+#end
+#if($paNeg)
+#set($dummy = $outNegSignals.add($paSig))
+#set($dummy = $outNegNames.add($paName))
+#set($dummy = $outNegArgs.add($paArgs))
+#else
+#set($dummy = $outPredNames.add($paName))
+#set($dummy = $outPredSignals.add($paSig))
+#set($dummy = $outPredArgs.add($paArgs))
+#end
+#elseif($report.containsStereotype($pin.type, "PDDL_Type"))
+#set($rawName = $pin.name)
+## Normalize "xxxOut" to "xxx"
+#if($rawName.endsWith("Out"))
+#set($pinName = $rawName.substring(0, $rawName.length() - 3).toLowerCase())
+#else
+#set($pinName = $rawName.toLowerCase())
+#end
+#if(!$seenParams.contains($pinName))
+#set($dummy = $seenParams.add($pinName))
+#set($pinTypeName = $pin.type.typename)
+#if(!$pinTypeName || $pinTypeName == "")#set($pinTypeName = $pin.type.name)#end
+#set($dummy = $seenParamTypes.add($pinTypeName.toLowerCase()))
+#set($dummy = $seenParamTypeElems.add($pin.type))
+#set($paramStr = "$paramStr ?$pinName - $pinTypeName.toLowerCase() ")
+#end
+#elseif($report.containsStereotype($pin.type, "PDDL_Function"))
+## Function pin with 'numericEffect' -> effect (increase (f args) rhs) and the like.
+#readNumTags($pin)
+#if(!$fpEff)
+#set($dummy = $actionComments.add("WARN output pin '$pin.name' is typed with <<PDDL_Function>> '$pin.type.name' but has no 'numericEffect'. Pin not transformed. Set numericEffect and numericValue or numericOperand (<<PDDL_PinAnnotation>>, Mode A) or reference the function in formulas (Mode B)"))
+#elseif($fpHasVal == $fpHasOpd)
+#set($dummy = $actionComments.add("WARN output pin '$pin.name' (function '$pin.type.name'): 'numericEffect' needs exactly one of numericValue and numericOperand. Pin not transformed"))
+#else
+#set($fpSym = $fpEff.name)
+#if($fpSym == "scaleUp")#set($fpSym = "scale-up")#elseif($fpSym == "scaleDown")#set($fpSym = "scale-down")#end
+#set($dummy = $outFuncSignals.add($pin.type))
+#set($dummy = $outFuncSyms.add($fpSym))
+#set($dummy = $outFuncVals.add("$fpVal"))
+#set($dummy = $outFuncOpds.add($fpOpd))
+#end
+#end
+#end
+#end
+#end
+## Fallback: the parameters string property, for activities without pins
+#if($paramStr.trim() == "")
+#if($elem.taggedValue)
+#foreach($tv in $elem.taggedValue)
+#if($tv.tagDefinition && $tv.tagDefinition.name == "parameters" && $tv.value && $tv.value.size() > 0)
+#set($paramStr = $tv.value.get(0))
+#end
+#end
+#end
+#end
+## =============================================================
+## Precondition and effect: Mode B takes precedence over Mode A. If either
+## tagged value is set, the whole action is Mode B; otherwise Mode A from the
+## predicate pins.
+## =============================================================
+#set($precondStr = "(and)")
+#set($effectStr = "(and)")
+#set($formulaWarn = [])
+#set($hasExplicitPre = false)
+#set($hasExplicitEff = false)
+#if($elem.taggedValue)
+#foreach($tv in $elem.taggedValue)
+#if($tv.tagDefinition && $tv.tagDefinition.name == "precondition" && $tv.value && $tv.value.size() > 0)
+#set($hasExplicitPre = true)
+#set($precondFormula = $tv.value.get(0))
+#set($precondStr = "#formulaToPDDL($precondFormula)")
+#end
+#if($tv.tagDefinition && $tv.tagDefinition.name == "effect" && $tv.value && $tv.value.size() > 0)
+#set($hasExplicitEff = true)
+#set($effectFormula = $tv.value.get(0))
+#set($effectStr = "#formulaToPDDL($effectFormula)")
+## A single numeric effect needs an (and ...) wrapper for the VAL parser
+#if($report.containsStereotype($effectFormula, "PDDL_Increase") || $report.containsStereotype($effectFormula, "PDDL_Decrease") || $report.containsStereotype($effectFormula, "PDDL_Assign") || $report.containsStereotype($effectFormula, "PDDL_ScaleUp") || $report.containsStereotype($effectFormula, "PDDL_ScaleDown"))#set($effectStr = "(and $effectStr)")#end
+#end
+#end
+#end
+## Mode B rendered nothing -> fall back rather than emit invalid PDDL
+#if($hasExplicitPre && $precondStr.trim() == "")
+#set($precondStr = "(and)")
+#set($dummy = $actionComments.add("WARN precondition formula rendered empty, fell back to (and)"))
+#end
+#if($hasExplicitEff && $effectStr.trim() == "")
+#set($effectStr = "(and)")
+#set($dummy = $actionComments.add("WARN effect formula rendered empty, fell back to (and)"))
+#end
+#foreach($fw in $formulaWarn)
+#set($dummy = $actionComments.add("WARN $fw"))
+#end
+#set($isModeB = ($hasExplicitPre || $hasExplicitEff))
+#if($isModeB && ($inFuncSignals.size() > 0 || $outFuncSignals.size() > 0))
+#set($dummy = $actionComments.add("WARN action '$actionName' uses Mode B (formulas), so its numeric pin annotations are ignored. Express comparison and effect in the formulas"))
+#end
+#if($isModeB && (!$hasExplicitPre || !$hasExplicitEff))
+#set($dummy = $actionComments.add("INFO mixed annotations: only one of precondition/effect explicit; Mode B used for the whole action"))
+#end
+## Mode A
+#if(!$isModeB && ($inPredNames.size() > 0 || $outPredNames.size() > 0 || $outNegSignals.size() > 0 || $inFuncSignals.size() > 0 || $outFuncSignals.size() > 0))
+#set($bindWarn = [])
+## The same predicate appears on a positive input pin and on an output pin.
+## Without 'arguments' the two atoms cannot be told apart. Negated input pins
+## are guards and do not count.
+#foreach($ipn in $inPredNames)
+#set($ipnIdx = $foreach.index)
+#if(!$inPredNeg.get($ipnIdx) && $outPredNames.contains($ipn))
+## If the input pin or an output pin of this predicate carries 'arguments', the atoms differ and no warning is needed.
+#set($mod12 = ($inPredArgs.get($ipnIdx) == ""))
+#foreach($opn in $outPredNames)#if($opn == $ipn && $outPredArgs.get($foreach.index) != "")#set($mod12 = false)#end#end
+#if($mod12)
+#set($dummy = $actionComments.add("WARN predicate '$ipn' appears on an input and an output pin. Without 'arguments' on the pins the negation rule cannot distinguish parameters. Set 'arguments' (<<PDDL_PinAnnotation>>) or use Mode B"))
+#end
+#end
+#end
+## Preconditions from incoming predicate pins. With 'arguments' on the pin these
+## form the atom, otherwise the binding through the signature.
+#set($preAtoms = "")
+#set($inAtomStrs = [])
+#set($argPins = 0)
+#foreach($ipSig in $inPredSignals)
+#set($ipIdx = $foreach.index)
+#if($inPredArgs.get($ipIdx) != "")
+#set($argPins = $argPins + 1)
+#set($ipAtom = "($inPredNames.get($ipIdx)$inPredArgs.get($ipIdx))")
+#foreach($pt in $inPredArgs.get($ipIdx).trim().split(" "))#if($pt != "" && !$seenParams.contains($pt.substring(1)))#set($dummy = $bindWarn.add("pin argument '$pt' of predicate '$inPredNames.get($ipIdx)' names no action parameter (PIN-08)"))#end#end
+#else
+#set($ipAtom = "#modusAAtom($ipSig $seenParams $seenParamTypes $seenParamTypeElems $bindWarn)")
+#end
+#set($dummy = $inAtomStrs.add($ipAtom))
+#if($inPredNeg.get($ipIdx))
+#set($preAtoms = "$preAtoms (not $ipAtom)")
+#else
+#set($preAtoms = "$preAtoms $ipAtom")
+#end
+#end
+## comparisons from function input pins
+#foreach($ifSig in $inFuncSignals)
+#set($ifIdx = $foreach.index)
+#set($ifTerm = "#modusAFunc($ifSig $seenParams $seenParamTypes $seenParamTypeElems $bindWarn)")
+#set($ifOpd = $inFuncOpds.get($ifIdx))
+#if($ifOpd)#set($ifRhs = "#formulaToPDDL($ifOpd)")#else#set($ifRhs = $inFuncVals.get($ifIdx))#end
+#set($preAtoms = "$preAtoms ($inFuncSyms.get($ifIdx) $ifTerm $ifRhs)")
+#end
+#set($precondStr = "(and$preAtoms)")
+## Effects: positive atoms, explicit deletes, and the negation rule
+#set($effAtoms = "")
+#set($outAtomStrs = [])
+#foreach($opSig in $outPredSignals)
+#set($opIdx = $foreach.index)
+#if($outPredArgs.get($opIdx) != "")
+#set($argPins = $argPins + 1)
+#set($opAtom = "($outPredNames.get($opIdx)$outPredArgs.get($opIdx))")
+#foreach($pt in $outPredArgs.get($opIdx).trim().split(" "))#if($pt != "" && !$seenParams.contains($pt.substring(1)))#set($dummy = $bindWarn.add("pin argument '$pt' of predicate '$outPredNames.get($opIdx)' names no action parameter (PIN-08)"))#end#end
+#else
+#set($opAtom = "#modusAAtom($opSig $seenParams $seenParamTypes $seenParamTypeElems $bindWarn)")
+#end
+#set($dummy = $outAtomStrs.add($opAtom))
+#set($effAtoms = "$effAtoms $opAtom")
+#end
+#foreach($onSig in $outNegSignals)
+#set($onIdx = $foreach.index)
+#if($outNegArgs.get($onIdx) != "")
+#set($argPins = $argPins + 1)
+#set($onAtom = "($outNegNames.get($onIdx)$outNegArgs.get($onIdx))")
+#foreach($pt in $outNegArgs.get($onIdx).trim().split(" "))#if($pt != "" && !$seenParams.contains($pt.substring(1)))#set($dummy = $bindWarn.add("pin argument '$pt' of predicate '$outNegNames.get($onIdx)' names no action parameter (PIN-08)"))#end#end
+#else
+#set($onAtom = "#modusAAtom($onSig $seenParams $seenParamTypes $seenParamTypeElems $bindWarn)")
+#end
+#set($effAtoms = "$effAtoms (not $onAtom)")
+#end
+## Negation rule: ToNegate = In \ Out \ Preserved. Preserved is read per flow
+## or pin from isPreserved and is empty by default. Negative preconditions do
+## not count as In. Whole atoms are compared: without 'arguments' the same
+## predicate gives the same atom, with 'arguments' (on ?c ?from) is deleted
+## when an output pin sets (on ?c ?to).
+#foreach($ipName in $inPredNames)
+#set($ipIdx = $foreach.index)
+#if(!$outAtomStrs.contains($inAtomStrs.get($ipIdx)) && !$inPredPres.get($ipIdx) && !$inPredNeg.get($ipIdx))
+#set($effAtoms = "$effAtoms (not $inAtomStrs.get($ipIdx))")
+#end
+#end
+## numeric effects from function output pins
+#foreach($ofSig in $outFuncSignals)
+#set($ofIdx = $foreach.index)
+#set($ofTerm = "#modusAFunc($ofSig $seenParams $seenParamTypes $seenParamTypeElems $bindWarn)")
+#set($ofOpd = $outFuncOpds.get($ofIdx))
+#if($ofOpd)#set($ofRhs = "#formulaToPDDL($ofOpd)")#else#set($ofRhs = $outFuncVals.get($ofIdx))#end
+#set($effAtoms = "$effAtoms ($outFuncSyms.get($ofIdx) $ofTerm $ofRhs)")
+#end
+#set($effectStr = "(and$effAtoms)")
+#set($numSuffix = "")
+#if($inFuncSignals.size() > 0 || $outFuncSignals.size() > 0)#set($numSuffix = ", numeric pins in: $inFuncSignals.size(), out: $outFuncSignals.size()")#end
+#if($argPins > 0)#set($numSuffix = "$numSuffix, pins with arguments: $argPins")#end
+#set($dummy = $actionComments.add("Mode A: derived from predicate-typed pins (In: $inPredNames.size(), Out: $outPredNames.size(), explicit deletes: $outNegSignals.size()$numSuffix)"))
+#foreach($bw in $bindWarn)
+#set($dummy = $actionComments.add("WARN $bw"))
+#end
+#elseif(!$isModeB)
+## Neither formulas nor predicate pins
+#set($dummy = $actionComments.add("WARN action '$actionName' has neither formula annotations (Mode B) nor predicate-typed pins (Mode A); empty precondition/effect generated"))
+#end
+
+## The tag 'cost' gives (increase (total-cost) <cost>) in the effect. If the action already changes total-cost, that
+## effect counts and the tag is skipped with a warning. Without a function total-cost: a warning, no effect.
+#set($costTag = "")
+#if($elem.taggedValue)#foreach($ctv in $elem.taggedValue)#if($ctv.tagDefinition && $ctv.tagDefinition.name == "cost" && $ctv.value && $ctv.value.size() > 0)#set($costTag = "$ctv.value.get(0)")#end#end#end
+#if($costTag != "")
+#if($costTag.endsWith(".0"))#set($costLen = $costTag.length() - 2)#set($costTag = $costTag.substring(0, $costLen))#end
+#if(!$costTc)
+#set($dummy = $actionComments.add("WARN action '$actionName' has cost $costTag, but the model has no function total-cost without parameters. The cost is not generated."))
+#elseif($effectStr.matches("(?s).*\((increase|decrease|assign|scale-up|scale-down) \($costTcName\).*"))
+#set($dummy = $actionComments.add("WARN action '$actionName' has cost $costTag and changes $costTcName in its effect. The effect counts, the tag is ignored."))
+#else
+#set($costEff = "(increase ($costTcName) $costTag)")
+#set($effectStr = $effectStr.trim())
+#if($effectStr == "(and)")#set($effectStr = "(and $costEff)")
+#elseif($effectStr.startsWith("(and "))#set($costLen = $effectStr.length() - 1)#set($effectStr = "$effectStr.substring(0, $costLen) $costEff)")
+#else#set($effectStr = "(and $effectStr $costEff)")#end
+#end
+#end
+#foreach($ac in $actionComments)
+  ;; $ac
+#end
+  (:action $actionName
+    :parameters ($paramStr.trim())
+    :precondition $precondStr
+    :effect $effectStr
+  )
+#else
+## Duplicate call. An identical signature is a legitimate repeated call and
+## gives no message. A differing signature means a second call with a different
+## meaning whose schema is dropped. Only that case is reported.
+#if($actionSigs.get($processedActions.indexOf($actionName)) != $sig)
+  ;; WARN action '$actionName' is called more than once with different pin/formula signatures.
+  ;;      Only the first call was used to generate the schema. This one was dropped.
+  ;;      first: $actionSigs.get($processedActions.indexOf($actionName))
+  ;;      this : $sig
+  ;;      Give the calls distinct 'actionName' values or make their annotations identical.
+#end
+#end
+#else
+## Neither actionName nor a name
+  ;; WARN a call with <<PDDL_Action>> has neither 'actionName' nor a name. No action generated.
+#end
+#end
+#end
+
+)
+#end
